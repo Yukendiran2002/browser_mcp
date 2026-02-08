@@ -1,0 +1,54 @@
+{
+  "name": "browser-mcp-server",
+  "version": "2.0.0",
+  "description": "The most comprehensive Browser MCP Server — 70 tools with human-like behavior, stealth anti-detection, session reuse, multi-browser support (Chromium/Firefox/WebKit), 50+ device presets, proxy, network monitoring, and token-optimized outputs for AI agents.",
+  "main": "dist/index.js",
+  "bin": {
+    "browser-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').copyFileSync('src/mark_page.js','dist/mark_page.js')\"",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "clean": "rimraf dist"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser",
+    "automation",
+    "ai-agent",
+    "playwright",
+    "stealth",
+    "anti-detection",
+    "human-like",
+    "web-scraping",
+    "browser-automation",
+    "session-reuse",
+    "device-emulation",
+    "multi-browser",
+    "proxy",
+    "network-monitoring"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "author": "",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "playwright": "^1.52.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "rimraf": "^6.0.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}

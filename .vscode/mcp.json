@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "browser": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "F:/Browser MCP Server/dist/index.js"
+      ]
+    }
+  }
+}
