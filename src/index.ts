@@ -44,6 +44,9 @@ function parseArgs(): BrowserConnectionOptions {
       case "--browser":
         options.browser = args[++i] as "chromium" | "firefox" | "webkit";
         break;
+      case "--channel":
+        options.channel = args[++i];
+        break;
       case "--proxy-server":
         options.proxyServer = args[++i];
         break;
@@ -105,6 +108,7 @@ CONNECTION:
 
 BROWSER:
   --browser <engine>          Browser engine: chromium, firefox, webkit (default: chromium)
+  --channel <channel>         Use installed browser: chrome, msedge, chrome-beta, msedge-dev
   --headless                  Run browser in headless mode
   --timeout <ms>              Default action timeout (default: 30000)
 

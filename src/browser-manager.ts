@@ -62,6 +62,8 @@ export interface BrowserConnectionOptions {
   ignoreHTTPSErrors?: boolean;
   /** Block service workers */
   blockServiceWorkers?: boolean;
+  /** Browser channel: 'chrome', 'msedge', 'chrome-beta', 'msedge-dev' — uses YOUR installed browser */
+  channel?: string;
 }
 
 export interface ConsoleLogEntry {
@@ -207,8 +209,14 @@ export class BrowserManager {
       opts.viewport = null; // Use browser default
     }
 
-    // User agent
-    opts.userAgent = o.userAgent || opts.userAgent || DEFAULT_USER_AGENT;
+    // User agent — ONLY override if explicitly set or device emulation is active
+    // Changing UA on an existing profile invalidates sessions on many sites (Google, GitHub, etc.)
+    if (o.userAgent) {
+      opts.userAgent = o.userAgent;
+    } else if (!opts.userAgent) {
+      // Only set default UA for temporary browsers, NOT for persistent/CDP sessions
+      // This is handled per-connection method below
+    }
 
     // Proxy
     if (o.proxyServer) {
@@ -274,12 +282,28 @@ export class BrowserManager {
     const url = cdpUrl ?? this.options.cdpUrl ?? "http://localhost:9222";
     this.browser = await chromium.connectOverCDP(url);
     const contexts = this.browser.contexts();
-    this.context = contexts.length > 0 ? contexts[0] : await this.browser.newContext();
+
+    if (contexts.length > 0) {
+      // Reuse the EXISTING context — this preserves all cookies, logins, sessions
+      this.context = contexts[0];
+    } else {
+      // No existing context (rare) — create one but DON'T override user agent
+      // so that any subsequent logins use the browser's real UA
+      this.context = await this.browser.newContext();
+    }
+
     for (const page of this.context.pages()) {
       const id = this.nextPageId++;
       this.pages.set(id, page);
       this.setupPageTracking(page, id);
     }
+
+    // Listen for new tabs opened in the existing session
+    this.context.on("page", (page) => {
+      const id = this.nextPageId++;
+      this.pages.set(id, page);
+      this.setupPageTracking(page, id);
+    });
   }
 
   /** Launch a browser reusing a user-data-dir so cookies/sessions persist. */
@@ -290,13 +314,31 @@ export class BrowserManager {
     const browserType = this.getBrowserType();
     const contextOpts = this.buildContextOptions();
 
-    this.context = await browserType.launchPersistentContext(dir, {
-      headless: this.options.headless,
-      executablePath: this.options.executablePath,
-      args: STEALTH_ARGS,
-      ignoreDefaultArgs: ["--enable-automation"],
-      ...contextOpts,
-    });
+    // For persistent contexts: do NOT override user agent unless explicitly set
+    // Changing UA causes sites to invalidate existing sessions
+    if (!this.options.userAgent && !this.options.device) {
+      delete contextOpts.userAgent;
+    }
+
+    try {
+      this.context = await browserType.launchPersistentContext(dir, {
+        headless: this.options.headless,
+        executablePath: this.options.executablePath,
+        channel: this.options.channel,
+        args: STEALTH_ARGS,
+        ignoreDefaultArgs: ["--enable-automation"],
+        ...contextOpts,
+      });
+    } catch (err: any) {
+      if (err.message?.includes("lock") || err.message?.includes("already running") || err.message?.includes("SingletonLock")) {
+        throw new Error(
+          `Chrome profile is locked — close ALL Chrome windows first, then retry.\n` +
+          `Or use CDP instead: start Chrome with --remote-debugging-port=9222 and use --cdp http://localhost:9222\n` +
+          `Original error: ${err.message}`
+        );
+      }
+      throw err;
+    }
 
     await this.context.addInitScript(STEALTH_SCRIPT);
 
@@ -321,6 +363,7 @@ export class BrowserManager {
     const launchOpts: any = {
       headless: this.options.headless,
       executablePath: this.options.executablePath,
+      channel: this.options.channel,
       args: STEALTH_ARGS,
     };
 
@@ -333,6 +376,10 @@ export class BrowserManager {
 
     this.browser = await browserType.launch(launchOpts);
     delete contextOpts.proxy;
+    // For temp browsers, set default UA if none specified (sessions don't matter here)
+    if (!contextOpts.userAgent) {
+      contextOpts.userAgent = DEFAULT_USER_AGENT;
+    }
     this.context = await this.browser.newContext(contextOpts);
     await this.context.addInitScript(STEALTH_SCRIPT);
 
@@ -364,7 +411,8 @@ export class BrowserManager {
       await this.launchTemporary();
       const device = this.options.device ? ` (device: ${this.options.device})` : "";
       const proxy = this.options.proxyServer ? ` (proxy: ${this.options.proxyServer})` : "";
-      return `Launched ${this.options.browser || "chromium"}${device}${proxy}`;
+      const channel = this.options.channel ? ` (channel: ${this.options.channel})` : "";
+      return `Launched ${this.options.browser || "chromium"}${channel}${device}${proxy}`;
     }
   }
 

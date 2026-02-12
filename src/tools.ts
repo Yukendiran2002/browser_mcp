@@ -56,19 +56,20 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
 
   server.tool(
     "browser_connect",
-    "Connect to a browser. Supports Chromium/Firefox/WebKit, device emulation, proxy, geolocation.",
+    "Connect to a browser. Supports Chromium/Firefox/WebKit, device emulation, proxy, geolocation. Use cdpUrl to reuse existing Chrome sessions with all logins intact.",
     {
       cdpUrl: z.string().optional().describe("CDP URL, e.g. http://localhost:9222"),
       userDataDir: z.string().optional().describe("Chrome user-data-dir for session reuse"),
       executablePath: z.string().optional().describe("Chrome/Edge executable path"),
       headless: z.boolean().optional().describe("Run headless (default: false)"),
       browserEngine: z.enum(["chromium", "firefox", "webkit"]).optional().describe("Browser engine"),
+      channel: z.string().optional().describe("Use installed browser: chrome, msedge, chrome-beta, msedge-dev"),
       proxyServer: z.string().optional().describe("Proxy URL (http://proxy:8080 or socks5://proxy:1080)"),
       device: z.string().optional().describe("Device preset (e.g. 'iPhone 15', 'Pixel 7')"),
       viewportWidth: z.number().optional(),
       viewportHeight: z.number().optional(),
     },
-    async ({ cdpUrl, userDataDir, executablePath, headless, browserEngine, proxyServer, device, viewportWidth, viewportHeight }) => {
+    async ({ cdpUrl, userDataDir, executablePath, headless, browserEngine, channel, proxyServer, device, viewportWidth, viewportHeight }) => {
       try {
         const opts: any = {};
         if (cdpUrl) opts.cdpUrl = cdpUrl;
@@ -76,6 +77,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
         if (executablePath) opts.executablePath = executablePath;
         if (headless !== undefined) opts.headless = headless;
         if (browserEngine) opts.browser = browserEngine;
+        if (channel) opts.channel = channel;
         if (proxyServer) opts.proxyServer = proxyServer;
         if (device) opts.device = device;
         if (viewportWidth) opts.viewportWidth = viewportWidth;
