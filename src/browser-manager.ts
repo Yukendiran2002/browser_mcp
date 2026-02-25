@@ -11,6 +11,7 @@ import {
   Response,
 } from "playwright";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { spawn, ChildProcess } from "node:child_process";
 import { getDevicePreset, DevicePreset, DEVICE_PRESETS } from "./devices.js";
 
 // ─── Types ───────────────────────────────────────────────────
@@ -85,65 +86,18 @@ export interface NetworkLogEntry {
 
 // ─── Anti-Detection ──────────────────────────────────────────
 
-/** Anti-detection stealth script injected into every page. */
+/** Minimal stealth script — only hides the webdriver flag, nothing else.
+ *  All other browser properties stay real to avoid detection. */
 const STEALTH_SCRIPT = `
-  // Override navigator.webdriver to false
+  // Hide the webdriver flag that Playwright sets
   Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  // Override chrome.runtime to look normal
-  if (!window.chrome) window.chrome = {};
-  if (!window.chrome.runtime) window.chrome.runtime = {};
-  // Override permissions query
-  const origQuery = window.navigator.permissions?.query?.bind(window.navigator.permissions);
-  if (origQuery) {
-    window.navigator.permissions.query = (params) =>
-      params.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : origQuery(params);
-  }
-  // Override plugins to look like a real browser
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-  });
-  Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-  });
-  // Override WebGL vendor/renderer
-  const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
-  WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Intel Inc.';
-    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-    return getParameterOrig.call(this, parameter);
-  };
-  // Canvas fingerprint noise
-  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-  HTMLCanvasElement.prototype.toDataURL = function(type) {
-    if (this.width === 0 && this.height === 0) return origToDataURL.apply(this, arguments);
-    const ctx = this.getContext('2d');
-    if (ctx) {
-      const imgData = ctx.getImageData(0, 0, Math.min(this.width, 2), Math.min(this.height, 2));
-      imgData.data[0] = imgData.data[0] ^ 1;
-      ctx.putImageData(imgData, 0, 0);
-    }
-    return origToDataURL.apply(this, arguments);
-  };
-  // Hide automation indicators
   delete navigator.__proto__.webdriver;
-  // Override connection.rtt for consistency
-  if (navigator.connection) {
-    Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
-  }
 `;
 
-const DEFAULT_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-
+/** Minimal launch args — only disable automation detection flag.
+ *  No sandbox, networking, or component flags that alter browser behavior. */
 const STEALTH_ARGS = [
   "--disable-blink-features=AutomationControlled",
-  "--disable-infobars",
-  "--no-first-run",
-  "--no-default-browser-check",
-  "--disable-component-update",
-  "--disable-background-networking",
 ];
 
 // ─── Browser Manager ─────────────────────────────────────────
@@ -165,6 +119,7 @@ export class BrowserManager {
   private networkLogs: Map<number, NetworkLogEntry[]> = new Map();
   private blockedPatterns: string[] = [];
   private isRecordingVideo = false;
+  private chromeProcess: ChildProcess | null = null;
 
   constructor(options: BrowserConnectionOptions = {}) {
     this.options = {
@@ -306,6 +261,83 @@ export class BrowserManager {
     });
   }
 
+  /**
+   * Resolve the Chrome/Edge executable path based on channel or explicit path.
+   */
+  private resolveChromePath(): string {
+    if (this.options.executablePath) return this.options.executablePath;
+    const channel = this.options.channel || 'chrome';
+    const paths: Record<string, string[]> = {
+      'chrome': [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+      ],
+      'chrome-beta': [
+        'C:\\Program Files\\Google\\Chrome Beta\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome Beta\\Application\\chrome.exe',
+      ],
+      'msedge': [
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      ],
+      'msedge-dev': [
+        'C:\\Program Files (x86)\\Microsoft\\Edge Dev\\Application\\msedge.exe',
+      ],
+    };
+    const candidates = paths[channel] || paths['chrome'];
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+    // If not found in known paths, just return the channel name and hope it's on PATH
+    return channel === 'msedge' ? 'msedge.exe' : 'chrome.exe';
+  }
+
+  /**
+   * Spawn Chrome/Edge with --remote-debugging-port and connect via CDP.
+   * This is used when launchPersistentContext fails (e.g. Chrome blocks
+   * --remote-debugging-pipe on its default user-data-dir).
+   */
+  async spawnChromeAndConnect(userDataDir: string, port = 9222): Promise<string> {
+    const chromePath = this.resolveChromePath();
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${userDataDir}`,
+      ...STEALTH_ARGS,
+    ];
+    if (this.options.headless) args.push('--headless=new');
+
+    // Spawn Chrome as a detached process
+    this.chromeProcess = spawn(chromePath, args, {
+      detached: true,
+      stdio: 'ignore',
+    });
+    this.chromeProcess.unref();
+
+    // Wait for Chrome to start and open the debugging port
+    const cdpUrl = `http://localhost:${port}`;
+    const maxWait = 15_000; // 15 seconds
+    const interval = 500;
+    let waited = 0;
+    while (waited < maxWait) {
+      try {
+        const resp = await fetch(`${cdpUrl}/json/version`);
+        if (resp.ok) break;
+      } catch {
+        // Chrome not ready yet
+      }
+      await new Promise(r => setTimeout(r, interval));
+      waited += interval;
+    }
+    if (waited >= maxWait) {
+      throw new Error(`Chrome did not start within ${maxWait / 1000}s. Ensure no other Chrome instances are running and try again.`);
+    }
+
+    // Connect via CDP
+    await this.connectCDP(cdpUrl);
+    return `Launched real ${this.options.channel || 'chrome'} with your profile and connected via CDP at ${cdpUrl}`;
+  }
+
   /** Launch a browser reusing a user-data-dir so cookies/sessions persist. */
   async launchPersistent(userDataDir?: string): Promise<void> {
     const dir = userDataDir ?? this.options.userDataDir ?? "";
@@ -330,6 +362,14 @@ export class BrowserManager {
         ...contextOpts,
       });
     } catch (err: any) {
+      // Chrome rejects --remote-debugging-pipe on its default data directory.
+      // Auto-fallback: spawn Chrome with --remote-debugging-port and connect via CDP.
+      if (err.message?.includes("non-default data directory") || err.message?.includes("remote debugging")) {
+        // This will be handled by connect() — rethrow with a special marker
+        const e = new Error(`NEEDS_CDP_FALLBACK: ${err.message}`);
+        (e as any).needsCdpFallback = true;
+        throw e;
+      }
       if (err.message?.includes("lock") || err.message?.includes("already running") || err.message?.includes("SingletonLock")) {
         throw new Error(
           `Chrome profile is locked — close ALL Chrome windows first, then retry.\n` +
@@ -376,10 +416,7 @@ export class BrowserManager {
 
     this.browser = await browserType.launch(launchOpts);
     delete contextOpts.proxy;
-    // For temp browsers, set default UA if none specified (sessions don't matter here)
-    if (!contextOpts.userAgent) {
-      contextOpts.userAgent = DEFAULT_USER_AGENT;
-    }
+    // Let the browser use its own real user agent — no fake UA override
     this.context = await this.browser.newContext(contextOpts);
     await this.context.addInitScript(STEALTH_SCRIPT);
 
@@ -401,8 +438,17 @@ export class BrowserManager {
       return `Connected via CDP to ${this.options.cdpUrl}`;
     }
     if (this.options.userDataDir) {
-      await this.launchPersistent();
-      return `Launched persistent ${this.options.browser || "chromium"} with profile: ${this.options.userDataDir}`;
+      try {
+        await this.launchPersistent();
+        return `Launched persistent ${this.options.browser || "chromium"} with profile: ${this.options.userDataDir}`;
+      } catch (err: any) {
+        if (err.needsCdpFallback) {
+          // Chrome rejected --remote-debugging-pipe on its default data dir.
+          // Auto-fallback: spawn real Chrome + connect via CDP.
+          return await this.spawnChromeAndConnect(this.options.userDataDir);
+        }
+        throw err;
+      }
     }
     try {
       await this.connectCDP("http://localhost:9222");
@@ -671,6 +717,15 @@ export class BrowserManager {
       } catch {
         /* ignore */
       }
+    }
+    // Clean up spawned Chrome process if we launched one
+    if (this.chromeProcess) {
+      try {
+        this.chromeProcess.kill();
+      } catch {
+        /* ignore */
+      }
+      this.chromeProcess = null;
     }
     this.pages.clear();
     this.consoleLogs.clear();

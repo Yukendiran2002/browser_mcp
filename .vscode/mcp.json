@@ -4,7 +4,11 @@
       "type": "stdio",
       "command": "node",
       "args": [
-        "F:/Browser MCP Server/dist/index.js"
+        "F:/Browser MCP Server/dist/index.js",
+        "--channel",
+        "chrome",
+        "--user-data-dir",
+        "C:/Users/ADMIN/AppData/Local/Google/Chrome/MCP Browser Data"
       ]
     }
   }
