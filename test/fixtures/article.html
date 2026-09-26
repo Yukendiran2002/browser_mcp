@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><title>How Browsers Render Pages</title><meta name="author" content="Jane Doe"></head><body>
+<div id="cookie-banner" class="cookie-consent">We use cookies. <button>Accept</button></div>
+<nav class="menu"><a href="/">Home</a><a href="/blog">Blog</a><a href="/docs">Docs</a></nav>
+<div class="layout">
+<aside class="sidebar"><h3>Related</h3><ul><li><a href="/a">Other post A</a></li><li><a href="/b">Other post B</a></li></ul></aside>
+<div class="content">
+<h1>How Browsers Render Pages</h1>
+<p>Rendering starts when the browser parses <strong>HTML</strong> into the DOM tree and CSS into the CSSOM. The two are combined into a render tree that only contains visible nodes.</p>
+<h2>Layout</h2>
+<p>During layout the browser computes the exact position and size of each node. This step is also called <em>reflow</em>, and it is expensive on large documents. See <a href="https://developer.mozilla.org/docs/Web/Performance">MDN performance guide</a>.</p>
+<ul><li>Parse HTML</li><li>Build CSSOM<ul><li>Cascade</li><li>Specificity</li></ul></li><li>Layout and paint</li></ul>
+<h2>Paint and composite</h2>
+<p>Paint fills in pixels, and compositing draws layers to the screen in the correct order. GPU acceleration makes compositing fast.</p>
+<pre><code class="language-js">requestAnimationFrame(() =&gt; draw());</code></pre>
+<table><tr><th>Stage</th><th>Cost</th></tr><tr><td>Layout</td><td>High</td></tr><tr><td>Paint</td><td>Medium</td></tr></table>
+</div></div>
+<footer class="footer"><p>© 2026 Render Blog</p></footer>
+</body></html>

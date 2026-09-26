@@ -1,4 +1,5 @@
-import { Page } from "playwright";
+import type { Page, ElementHandle } from "playwright";
+import { isRef, resolveRef } from "./snapshot.js";
 
 /**
  * Utility helpers shared across tools.
@@ -13,21 +14,84 @@ export async function waitForStable(page: Page, timeout = 5000): Promise<void> {
   }
 }
 
+const HTML_TAGS = new Set(
+  ("a abbr address article aside audio b blockquote body button canvas caption code dd details dialog div dl dt em " +
+    "fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hr i iframe img input label legend li main nav ol " +
+    "option p pre section select small span strong summary table tbody td textarea th thead tr ul video svg").split(" ")
+);
+
 /** Build a smart CSS/XPath/text selector from user input. */
 export function buildSelector(selector: string): string {
-  // If user passed something that looks like XPath, use it directly
-  if (selector.startsWith("//") || selector.startsWith("(//")) {
-    return `xpath=${selector}`;
+  const s = selector.trim();
+  // Explicit Playwright engine (css=, xpath=, text=, role=, internal:…)
+  if (/^(css|xpath|text|role|id|data-testid|nth|internal:[a-z-]+)=/.test(s) || s.startsWith("internal:")) return s;
+  if (s.startsWith("//") || s.startsWith("(//")) return `xpath=${s}`;
+  if (HTML_TAGS.has(s.toLowerCase())) return s.toLowerCase();
+  // Looks like CSS (has . # [ > : ~ + * or a tag followed by combinators)
+  if (/[.#\[\]>:~+*=]/.test(s) && !/\s{2,}/.test(s) && /^[\w.#\[*:-]/.test(s)) return s;
+  // Plain words → exact visible text
+  return `text="${s.replace(/"/g, '\\"')}"`;
+}
+
+/** Candidate selectors for free text: exact text, then labels/attributes, then substring. */
+function textCandidates(s: string): string[] {
+  const q = JSON.stringify(s);
+  return [
+    `text=${q}`,
+    `internal:label=${q}i`,
+    `[aria-label=${q} i]`,
+    `[placeholder=${q} i]`,
+    `[title=${q} i]`,
+    `text=${s}`,
+  ];
+}
+
+/**
+ * Resolve a selector, visible text, or snapshot ref ("e12", "f1e3") to an element.
+ * Waits up to `timeout` ms for the element to appear. Returns null if not found;
+ * throws for stale refs so the agent knows to take a fresh snapshot.
+ */
+export async function locate(page: Page, selector: string, timeout = 5000): Promise<ElementHandle | null> {
+  const s = selector.trim();
+  if (isRef(s)) {
+    const el = await resolveRef(page, s);
+    if (!el) throw new Error(`Ref ${s} is stale or unknown — call snapshot to get fresh refs`);
+    return el;
   }
-  // If it looks like a CSS selector (has . # [ > : etc.), use as-is
-  if (/^[.#\[\w]/.test(selector) && /[.#\[\]>:~+]/.test(selector)) {
-    return selector;
+  const built = buildSelector(s);
+  const candidates = built.startsWith('text="') ? textCandidates(s) : [built];
+  for (const c of candidates) {
+    try {
+      const el = await page.$(c);
+      if (el) return toControl(el);
+    } catch {
+      /* invalid selector for this engine — try the next */
+    }
   }
-  // If it looks like an aria role/label, use text matching
-  if (/^[A-Za-z\s]+$/.test(selector.trim())) {
-    return `text="${selector}"`;
+  if (timeout <= 0) return null;
+  try {
+    let loc = page.locator(candidates[0]);
+    for (const c of candidates.slice(1)) loc = loc.or(page.locator(c));
+    const first = loc.first();
+    await first.waitFor({ state: "attached", timeout });
+    const el = await first.elementHandle({ timeout: 1000 });
+    return el ? toControl(el) : null;
+  } catch {
+    return null;
   }
-  return selector;
+}
+
+/** A <label> matched by text stands for its form control. */
+async function toControl(el: ElementHandle): Promise<ElementHandle> {
+  const control = await el.evaluateHandle((n: any) => (n.tagName === "LABEL" && n.control ? n.control : n));
+  return (control.asElement() as ElementHandle) || el;
+}
+
+/** Like locate() but throws a helpful error when nothing matches. */
+export async function mustLocate(page: Page, selector: string, timeout = 5000): Promise<ElementHandle> {
+  const el = await locate(page, selector, timeout);
+  if (!el) throw new Error(`Not found: ${selector} (tip: call snapshot and use a ref like e12)`);
+  return el;
 }
 
 /** Take a lightweight text snapshot of visible page elements using ARIA. */

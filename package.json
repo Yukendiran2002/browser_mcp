@@ -1,7 +1,7 @@
 {
   "name": "browser-mcp-server",
-  "version": "2.0.0",
-  "description": "The most comprehensive Browser MCP Server — 70 tools with human-like behavior, stealth anti-detection, session reuse, multi-browser support (Chromium/Firefox/WebKit), 50+ device presets, proxy, network monitoring, and token-optimized outputs for AI agents.",
+  "version": "3.0.0",
+  "description": "Fast, token-efficient browser automation and web scraping MCP server: ref-based snapshots with diffs, batched actions, HTTP-first scraping with browser fallback, crawl/map, and learn-once zero-LLM extractors (DejavuScraper).",
   "main": "dist/index.js",
   "bin": {
     "browser-mcp-server": "dist/index.js"
@@ -10,7 +10,9 @@
     "build": "tsc && node -e \"require('fs').copyFileSync('src/mark_page.js','dist/mark_page.js')\"",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "clean": "rimraf dist"
+    "clean": "rimraf dist",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:unit": "node --test test/content.test.mjs"
   },
   "keywords": [
     "mcp",
@@ -28,12 +30,20 @@
     "device-emulation",
     "multi-browser",
     "proxy",
-    "network-monitoring"
+    "network-monitoring",
+    "web-scraper",
+    "crawler",
+    "markdown",
+    "llm",
+    "token-efficient",
+    "dejavu-scraper",
+    "autoscraper",
+    "structured-data"
   ],
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.18.1"
   },
   "repository": {
     "type": "git",
@@ -42,7 +52,9 @@
   "author": "",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "linkedom": "^0.18.13",
     "playwright": "^1.52.0",
+    "undici": "^7.30.0",
     "zod": "^3.24.4"
   },
   "devDependencies": {
@@ -50,5 +62,10 @@
     "rimraf": "^6.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
-  }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }

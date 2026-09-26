@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><title>Sign in</title></head><body>
+<header><nav><a href="/">Home</a><a href="/help">Help</a></nav></header>
+<main>
+<h1>Sign in</h1>
+<form id="login" onsubmit="event.preventDefault(); document.getElementById('msg').textContent='Welcome, '+document.getElementById('email').value; document.getElementById('msg').hidden=false;">
+  <label for="email">Email</label><input id="email" type="email" placeholder="you@example.com" required>
+  <label>Password <input id="pw" type="password"></label>
+  <label><input type="checkbox" id="remember"> Remember me</label>
+  <select id="country" aria-label="Country"><option>India</option><option>USA</option></select>
+  <button type="submit">Sign in</button>
+</form>
+<p id="msg" role="status" hidden></p>
+<div id="menu-btn" style="cursor:pointer" onclick="document.getElementById('drop').style.display='block'">Open menu</div>
+<div id="drop" style="display:none"><a href="/settings">Settings</a><a href="/logout">Log out</a></div>
+<iframe srcdoc="<button onclick=&quot;this.textContent='clicked'&quot;>Frame button</button>"></iframe>
+</main></body></html>

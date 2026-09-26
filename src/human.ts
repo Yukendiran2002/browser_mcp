@@ -11,6 +11,23 @@ import { Page } from "playwright";
  * - Click coordinate jitter (humans don't click exact center)
  */
 
+// ─── Mode ───────────────────────────────────────────────────
+
+/**
+ * Human mode adds realistic timing and motion (slower, harder to detect).
+ * Fast mode (default) performs the same real mouse/keyboard events with no
+ * artificial delays — several times faster per action.
+ */
+let humanMode = false;
+
+export function setHumanMode(on: boolean): void {
+  humanMode = on;
+}
+
+export function isHumanMode(): boolean {
+  return humanMode;
+}
+
 // ─── Random Helpers ─────────────────────────────────────────
 
 /** Random number between min and max (inclusive). */
@@ -25,6 +42,7 @@ function randf(min: number, max: number): number {
 
 /** Sleep for a random duration within range. */
 export function humanDelay(minMs = 50, maxMs = 300): Promise<void> {
+  if (!humanMode) return Promise.resolve();
   return new Promise((r) => setTimeout(r, rand(minMs, maxMs)));
 }
 
@@ -97,6 +115,12 @@ export async function humanMouseMove(page: Page, toX: number, toY: number): Prom
     y: rand(0, viewport.height),
   };
 
+  if (!humanMode) {
+    await page.mouse.move(toX, toY);
+    (page as any).__lastMousePos = { x: toX, y: toY };
+    return;
+  }
+
   const distance = Math.sqrt(Math.pow(toX - currentPos.x, 2) + Math.pow(toY - currentPos.y, 2));
   // More steps for longer distances, fewer for short ones
   const steps = Math.max(5, Math.min(25, Math.floor(distance / 30)));
@@ -123,6 +147,12 @@ export async function humanClick(
   y: number,
   options: { button?: "left" | "right" | "middle"; clickCount?: number } = {}
 ): Promise<void> {
+  if (!humanMode) {
+    await page.mouse.click(x, y, { button: options.button ?? "left", clickCount: options.clickCount ?? 1 });
+    (page as any).__lastMousePos = { x, y };
+    return;
+  }
+
   // Add slight jitter to coordinates (±3px)
   const jitterX = x + rand(-3, 3);
   const jitterY = y + rand(-3, 3);
@@ -149,6 +179,10 @@ export async function humanClick(
  * Simulates different speeds for different characters.
  */
 export async function humanType(page: Page, text: string): Promise<void> {
+  if (!humanMode) {
+    await page.keyboard.type(text);
+    return;
+  }
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
 
@@ -188,6 +222,10 @@ export async function humanScroll(
   deltaY: number,
   deltaX = 0
 ): Promise<void> {
+  if (!humanMode) {
+    await page.mouse.wheel(deltaX, deltaY);
+    return;
+  }
   const totalSteps = Math.max(3, Math.min(12, Math.abs(deltaY) / 80));
   const stepY = deltaY / totalSteps;
   const stepX = deltaX / totalSteps;

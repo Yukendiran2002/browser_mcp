@@ -4,9 +4,12 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BrowserManager } from "./browser-manager.js";
+import { isRef } from "./snapshot.js";
 import { getDevicePreset, listDeviceNames, DEVICE_PRESETS } from "./devices.js";
 import {
   buildSelector,
+  locate,
+  mustLocate,
   waitForStable,
   getAccessibilityTree,
   getPageText,
@@ -54,102 +57,9 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
   //  1. CONNECTION
   // ══════════════════════════════════════════════════════════
 
-  server.tool(
-    "browser_connect",
-    "Connect to a browser. Supports Chromium/Firefox/WebKit, device emulation, proxy, geolocation. Use cdpUrl to reuse existing Chrome sessions with all logins intact.",
-    {
-      cdpUrl: z.string().optional().describe("CDP URL, e.g. http://localhost:9222"),
-      userDataDir: z.string().optional().describe("Chrome user-data-dir for session reuse"),
-      executablePath: z.string().optional().describe("Chrome/Edge executable path"),
-      headless: z.boolean().optional().describe("Run headless (default: false)"),
-      browserEngine: z.enum(["chromium", "firefox", "webkit"]).optional().describe("Browser engine"),
-      channel: z.string().optional().describe("Use installed browser: chrome, msedge, chrome-beta, msedge-dev"),
-      proxyServer: z.string().optional().describe("Proxy URL (http://proxy:8080 or socks5://proxy:1080)"),
-      device: z.string().optional().describe("Device preset (e.g. 'iPhone 15', 'Pixel 7')"),
-      viewportWidth: z.number().optional(),
-      viewportHeight: z.number().optional(),
-    },
-    async ({ cdpUrl, userDataDir, executablePath, headless, browserEngine, channel, proxyServer, device, viewportWidth, viewportHeight }) => {
-      try {
-        const opts: any = {};
-        if (cdpUrl) opts.cdpUrl = cdpUrl;
-        if (userDataDir) opts.userDataDir = userDataDir;
-        if (executablePath) opts.executablePath = executablePath;
-        if (headless !== undefined) opts.headless = headless;
-        if (browserEngine) opts.browser = browserEngine;
-        if (channel) opts.channel = channel;
-        if (proxyServer) opts.proxyServer = proxyServer;
-        if (device) opts.device = device;
-        if (viewportWidth) opts.viewportWidth = viewportWidth;
-        if (viewportHeight) opts.viewportHeight = viewportHeight;
-        if (Object.keys(opts).length > 0) {
-          browser.options = { ...browser.options, ...opts };
-        }
-        const msg = await browser.connect();
-        const pages = await browser.listPagesWithTitles();
-        const pageList = pages.map((p) => `  ${pageInfo(p.id, p.url, p.title)}`).join("\n");
-        return {
-          content: [{ type: "text" as const, text: `${msg}\nPages(${pages.length}):\n${pageList || "  (none)"}` }],
-        };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Connection failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
   // ══════════════════════════════════════════════════════════
   //  2. NAVIGATION
   // ══════════════════════════════════════════════════════════
-
-  server.tool(
-    "navigate",
-    "Navigate to a URL.",
-    {
-      url: z.string().describe("URL to navigate to"),
-      pageId: z.number().optional(),
-      waitUntil: z.enum(["load", "domcontentloaded", "networkidle", "commit"]).optional(),
-    },
-    async ({ url, pageId, waitUntil }) => {
-      try {
-        await beforeAction();
-        const { id, page } = await browser.getOrCreatePage(pageId);
-        await page.goto(url, { waitUntil: waitUntil ?? "domcontentloaded", timeout: 30_000 });
-        await humanDelay(200, 500);
-        const title = await page.title();
-        return { content: [{ type: "text" as const, text: pageInfo(id, url, title) }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Nav failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool("go_back", "Go back in browser history.", { pageId: z.number().optional() },
-    async ({ pageId }) => {
-      await beforeAction();
-      const { id, page } = await browser.getOrCreatePage(pageId);
-      await page.goBack({ waitUntil: "domcontentloaded" });
-      await humanDelay(100, 300);
-      return { content: [{ type: "text" as const, text: `[${id}] back: ${page.url()}` }] };
-    }
-  );
-
-  server.tool("go_forward", "Go forward in browser history.", { pageId: z.number().optional() },
-    async ({ pageId }) => {
-      await beforeAction();
-      const { id, page } = await browser.getOrCreatePage(pageId);
-      await page.goForward({ waitUntil: "domcontentloaded" });
-      await humanDelay(100, 300);
-      return { content: [{ type: "text" as const, text: `[${id}] fwd: ${page.url()}` }] };
-    }
-  );
-
-  server.tool("reload", "Reload the page.", { pageId: z.number().optional() },
-    async ({ pageId }) => {
-      const { id, page } = await browser.getOrCreatePage(pageId);
-      await page.reload({ waitUntil: "domcontentloaded" });
-      return { content: [{ type: "text" as const, text: `[${id}] reloaded` }] };
-    }
-  );
 
   server.tool(
     "wait_for_navigation",
@@ -218,150 +128,6 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
   // ══════════════════════════════════════════════════════════
 
   server.tool(
-    "click",
-    "Click an element with human-like mouse movement and timing.",
-    {
-      selector: z.string().describe("CSS selector, XPath, or visible text"),
-      pageId: z.number().optional(),
-      button: z.enum(["left", "right", "middle"]).optional(),
-      doubleClick: z.boolean().optional(),
-    },
-    async ({ selector, pageId, button, doubleClick }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        const sel = buildSelector(selector);
-        const el = await page.$(sel);
-        if (!el) return { content: [{ type: "text" as const, text: `Not found: ${selector}` }], isError: true };
-
-        const box = await el.boundingBox();
-        if (box) {
-          const cx = box.x + box.width / 2;
-          const cy = box.y + box.height / 2;
-          await humanClick(page, cx, cy, { button: button ?? "left", clickCount: doubleClick ? 2 : 1 });
-        } else {
-          await page.click(sel, { button: button ?? "left", clickCount: doubleClick ? 2 : 1 });
-        }
-        await waitForStable(page);
-        return { content: [{ type: "text" as const, text: `Clicked: ${truncate(selector, 60)}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Click failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "type_text",
-    "Type text with human-like keystroke timing and natural delays.",
-    {
-      text: z.string().describe("Text to type"),
-      selector: z.string().optional().describe("Element selector to focus first"),
-      pageId: z.number().optional(),
-      clearFirst: z.boolean().optional().describe("Clear field first (default: false)"),
-      pressEnter: z.boolean().optional().describe("Press Enter after (default: false)"),
-    },
-    async ({ text, selector, pageId, clearFirst, pressEnter }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-
-        if (selector) {
-          const sel = buildSelector(selector);
-          const el = await page.$(sel);
-          if (el) {
-            const box = await el.boundingBox();
-            if (box) {
-              await humanClick(page, box.x + box.width / 2, box.y + box.height / 2);
-            }
-          }
-          if (clearFirst) {
-            await page.fill(sel, "");
-            await microDelay();
-          }
-        } else if (clearFirst) {
-          await page.keyboard.down("Control");
-          await page.keyboard.press("a");
-          await page.keyboard.up("Control");
-          await page.keyboard.press("Backspace");
-          await microDelay();
-        }
-
-        await humanType(page, text);
-
-        if (pressEnter) {
-          await humanDelay(100, 300);
-          await page.keyboard.press("Enter");
-          await waitForStable(page);
-        }
-
-        return { content: [{ type: "text" as const, text: `Typed: "${truncate(text, 40)}"${pressEnter ? " + Enter" : ""}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Type failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "fill_form",
-    "Fill multiple form fields with human-like pauses between fields.",
-    {
-      fields: z.array(z.object({
-        selector: z.string(),
-        value: z.string(),
-      })),
-      pageId: z.number().optional(),
-      submit: z.boolean().optional(),
-    },
-    async ({ fields, pageId, submit }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        for (const { selector, value } of fields) {
-          const sel = buildSelector(selector);
-          const el = await page.$(sel);
-          if (el) {
-            const box = await el.boundingBox();
-            if (box) {
-              await humanClick(page, box.x + box.width / 2, box.y + box.height / 2);
-            }
-          }
-          await page.fill(sel, value);
-          await humanDelay(200, 500);
-        }
-        if (submit) {
-          await humanDelay(300, 700);
-          await page.keyboard.press("Enter");
-          await waitForStable(page);
-        }
-        return { content: [{ type: "text" as const, text: `Filled ${fields.length} fields${submit ? " + submitted" : ""}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Fill failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "select_option",
-    "Select dropdown option.",
-    {
-      selector: z.string(),
-      value: z.string().optional(),
-      label: z.string().optional(),
-      pageId: z.number().optional(),
-    },
-    async ({ selector, value, label, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        await beforeAction();
-        const sel = buildSelector(selector);
-        if (label) await page.selectOption(sel, { label });
-        else if (value) await page.selectOption(sel, value);
-        await microDelay();
-        return { content: [{ type: "text" as const, text: `Selected: ${label || value}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Select failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
     "check_checkbox",
     "Check/uncheck a checkbox or radio.",
     {
@@ -373,83 +139,13 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
       try {
         const { page } = await browser.getOrCreatePage(pageId);
         await beforeAction();
-        const sel = buildSelector(selector);
-        if (checked === false) await page.uncheck(sel);
-        else await page.check(sel);
+        const el = await mustLocate(page, selector);
+        if (checked === false) await el.uncheck();
+        else await el.check();
         await microDelay();
         return { content: [{ type: "text" as const, text: `${checked === false ? "Unchecked" : "Checked"}` }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Check failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "hover",
-    "Hover over element with natural mouse movement.",
-    { selector: z.string(), pageId: z.number().optional() },
-    async ({ selector, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        const el = await page.$(buildSelector(selector));
-        if (el) {
-          const box = await el.boundingBox();
-          if (box) {
-            await humanHover(page, box.x + box.width / 2, box.y + box.height / 2);
-            return { content: [{ type: "text" as const, text: `Hovering: ${truncate(selector, 60)}` }] };
-          }
-        }
-        await page.hover(buildSelector(selector));
-        return { content: [{ type: "text" as const, text: `Hovering: ${truncate(selector, 60)}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Hover failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "press_key",
-    "Press a key or combo (Enter, Control+C, ArrowDown, Tab, Escape).",
-    { key: z.string(), pageId: z.number().optional() },
-    async ({ key, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        await beforeAction();
-        await page.keyboard.press(key);
-        return { content: [{ type: "text" as const, text: `Key: ${key}` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Key failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "scroll",
-    "Scroll with human-like smooth motion.",
-    {
-      direction: z.enum(["up", "down", "left", "right"]),
-      amount: z.number().optional().describe("Pixels (default: 500)"),
-      selector: z.string().optional().describe("Scroll within specific element"),
-      pageId: z.number().optional(),
-    },
-    async ({ direction, amount, selector, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        const px = amount ?? 500;
-        const deltaX = direction === "right" ? px : direction === "left" ? -px : 0;
-        const deltaY = direction === "down" ? px : direction === "up" ? -px : 0;
-
-        if (selector) {
-          const el = await page.$(buildSelector(selector));
-          if (el) {
-            await el.evaluate((node, { dx, dy }) => node.scrollBy(dx, dy), { dx: deltaX, dy: deltaY });
-          }
-        } else {
-          await humanScroll(page, deltaY, deltaX);
-        }
-        return { content: [{ type: "text" as const, text: `Scrolled ${direction} ${px}px` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Scroll failed: ${err.message}` }], isError: true };
       }
     }
   );
@@ -461,9 +157,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const sel = buildSelector(selector);
-        const el = await page.$(sel);
-        if (!el) return { content: [{ type: "text" as const, text: `Not found: ${selector}` }], isError: true };
+        const el = await mustLocate(page, selector);
         await el.scrollIntoViewIfNeeded();
         await humanDelay(100, 300);
         return { content: [{ type: "text" as const, text: `Scrolled to: ${truncate(selector, 60)}` }] };
@@ -485,7 +179,8 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, state, timeout, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        await page.waitForSelector(buildSelector(selector), { state: state ?? "visible", timeout: timeout ?? 30_000 });
+        if (isRef(selector)) await (await mustLocate(page, selector)).waitForElementState(state === "hidden" || state === "detached" ? "hidden" : "visible", { timeout: timeout ?? 30_000 });
+        else await page.waitForSelector(buildSelector(selector), { state: state ?? "visible", timeout: timeout ?? 30_000 });
         return { content: [{ type: "text" as const, text: `Found: ${truncate(selector, 60)}` }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Wait failed: ${err.message}` }], isError: true };
@@ -508,89 +203,6 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
         return { content: [{ type: "text" as const, text: `Text found: "${truncate(text, 40)}"` }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Wait failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "drag_and_drop",
-    "Drag element to target with human-like mouse motion.",
-    {
-      sourceSelector: z.string(),
-      targetSelector: z.string(),
-      pageId: z.number().optional(),
-    },
-    async ({ sourceSelector, targetSelector, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        const src = await page.$(buildSelector(sourceSelector));
-        const tgt = await page.$(buildSelector(targetSelector));
-        if (src && tgt) {
-          const srcBox = await src.boundingBox();
-          const tgtBox = await tgt.boundingBox();
-          if (srcBox && tgtBox) {
-            const srcX = srcBox.x + srcBox.width / 2;
-            const srcY = srcBox.y + srcBox.height / 2;
-            const tgtX = tgtBox.x + tgtBox.width / 2;
-            const tgtY = tgtBox.y + tgtBox.height / 2;
-            await humanMouseMove(page, srcX, srcY);
-            await microDelay();
-            await page.mouse.down();
-            await humanDelay(100, 200);
-            await humanMouseMove(page, tgtX, tgtY);
-            await microDelay();
-            await page.mouse.up();
-          } else {
-            await page.dragAndDrop(buildSelector(sourceSelector), buildSelector(targetSelector));
-          }
-        } else {
-          await page.dragAndDrop(buildSelector(sourceSelector), buildSelector(targetSelector));
-        }
-        return { content: [{ type: "text" as const, text: `Dragged to target` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Drag failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "upload_file",
-    "Upload file(s) to input.",
-    {
-      selector: z.string(),
-      filePaths: z.union([z.string(), z.array(z.string())]).describe("Absolute path(s) to file(s)"),
-      pageId: z.number().optional(),
-    },
-    async ({ selector, filePaths, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        await page.setInputFiles(buildSelector(selector), filePaths);
-        const count = Array.isArray(filePaths) ? filePaths.length : 1;
-        return { content: [{ type: "text" as const, text: `Uploaded ${count} file(s)` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Upload failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "handle_dialog",
-    "Accept or dismiss browser dialog.",
-    {
-      action: z.enum(["accept", "dismiss"]),
-      promptText: z.string().optional(),
-      pageId: z.number().optional(),
-    },
-    async ({ action, promptText, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        page.once("dialog", async (dialog) => {
-          if (action === "accept") await dialog.accept(promptText);
-          else await dialog.dismiss();
-        });
-        return { content: [{ type: "text" as const, text: `Will ${action} next dialog` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Dialog failed: ${err.message}` }], isError: true };
       }
     }
   );
@@ -634,9 +246,8 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
         const max = maxLength ?? 20_000;
         let html: string;
         if (selector) {
-          const el = await page.$(buildSelector(selector));
-          if (!el) return { content: [{ type: "text" as const, text: `Not found: ${selector}` }], isError: true };
-          html = await el.evaluate((e) => e.outerHTML);
+          const el = await mustLocate(page, selector);
+          html = await el.evaluate((e: any) => e.outerHTML);
         } else {
           html = await page.content();
         }
@@ -654,7 +265,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const text = await page.textContent(buildSelector(selector));
+        const text = await (await mustLocate(page, selector)).innerText();
         return { content: [{ type: "text" as const, text: truncate(text ?? "(empty)", 2000) }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Failed: ${err.message}` }], isError: true };
@@ -669,7 +280,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, attribute, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const value = await page.getAttribute(buildSelector(selector), attribute);
+        const value = await (await mustLocate(page, selector)).getAttribute(attribute);
         return { content: [{ type: "text" as const, text: value ?? "(none)" }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Failed: ${err.message}` }], isError: true };
@@ -684,7 +295,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const value = await page.inputValue(buildSelector(selector));
+        const value = await (await mustLocate(page, selector)).inputValue();
         return { content: [{ type: "text" as const, text: value || "(empty)" }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Failed: ${err.message}` }], isError: true };
@@ -699,7 +310,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const el = await page.$(buildSelector(selector));
+        const el = await locate(page, selector, 0);
         return { content: [{ type: "text" as const, text: el ? "true" : "false" }] };
       } catch {
         return { content: [{ type: "text" as const, text: "false" }] };
@@ -729,8 +340,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     async ({ selector, pageId }) => {
       try {
         const { page } = await browser.getOrCreatePage(pageId);
-        const el = await page.$(buildSelector(selector));
-        if (!el) return { content: [{ type: "text" as const, text: `Not found: ${selector}` }], isError: true };
+        const el = await mustLocate(page, selector);
         const box = await el.boundingBox();
         if (!box) return { content: [{ type: "text" as const, text: "Not visible" }], isError: true };
         return {
@@ -738,34 +348,6 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
         };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Failed: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  server.tool(
-    "take_screenshot",
-    "Screenshot page or element.",
-    {
-      pageId: z.number().optional(),
-      selector: z.string().optional(),
-      fullPage: z.boolean().optional(),
-      path: z.string().optional(),
-    },
-    async ({ pageId, selector, fullPage, path }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        let buffer: Buffer;
-        if (selector) {
-          const el = await page.$(buildSelector(selector));
-          if (!el) return { content: [{ type: "text" as const, text: `Not found: ${selector}` }], isError: true };
-          buffer = await el.screenshot({ path, type: "png" });
-        } else {
-          buffer = await page.screenshot({ path, fullPage: fullPage ?? false, type: "png" });
-        }
-        if (path) return { content: [{ type: "text" as const, text: `Saved: ${path}` }] };
-        return { content: [{ type: "image" as const, data: buffer.toString("base64"), mimeType: "image/png" }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `Screenshot failed: ${err.message}` }], isError: true };
       }
     }
   );
@@ -879,22 +461,6 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
   //  6. JAVASCRIPT
   // ══════════════════════════════════════════════════════════
 
-  server.tool(
-    "evaluate_javascript",
-    "Run JavaScript in page context.",
-    { script: z.string(), pageId: z.number().optional() },
-    async ({ script, pageId }) => {
-      try {
-        const { page } = await browser.getOrCreatePage(pageId);
-        const result = await page.evaluate(script);
-        const output = typeof result === "string" ? result : JSON.stringify(result);
-        return { content: [{ type: "text" as const, text: truncate(output ?? "(void)", 4000) }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `JS error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
   // ══════════════════════════════════════════════════════════
   //  7. COOKIES & STORAGE (Compact)
   // ══════════════════════════════════════════════════════════
@@ -905,7 +471,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     { url: z.string().optional() },
     async ({ url }) => {
       try {
-        const ctx = browser.getContext();
+        const ctx = await browser.ensureContext();
         const cookies = url ? await ctx.cookies(url) : await ctx.cookies();
         const lines = cookies.map((c) => `${c.name}=${truncate(c.value, 40)} [${c.domain}]`);
         return { content: [{ type: "text" as const, text: `${cookies.length} cookies:\n${lines.join("\n")}` }] };
@@ -927,7 +493,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     },
     async ({ cookies }) => {
       try {
-        const ctx = browser.getContext();
+        const ctx = await browser.ensureContext();
         await ctx.addCookies(cookies as any);
         return { content: [{ type: "text" as const, text: `Set ${cookies.length} cookies` }] };
       } catch (err: any) {
@@ -942,7 +508,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     {},
     async () => {
       try {
-        const ctx = browser.getContext();
+        const ctx = await browser.ensureContext();
         await ctx.clearCookies();
         return { content: [{ type: "text" as const, text: `Cookies cleared` }] };
       } catch (err: any) {
@@ -1239,7 +805,7 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
     },
     async ({ patterns }) => {
       try {
-        const ctx = browser.getContext();
+        const ctx = await browser.ensureContext();
         for (const pattern of patterns) {
           browser.addBlockedPattern(pattern);
           await ctx.route(pattern, (route) => route.abort());
@@ -1803,10 +1369,4 @@ export function registerTools(server: McpServer, browser: BrowserManager): void 
   //  16. CLOSE BROWSER
   // ══════════════════════════════════════════════════════════
 
-  server.tool("close_browser", "Close browser and cleanup.", {},
-    async () => {
-      await browser.close();
-      return { content: [{ type: "text" as const, text: "Browser closed" }] };
-    }
-  );
 }
