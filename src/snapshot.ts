@@ -28,6 +28,10 @@ export interface SnapshotOptions {
   prefix?: string;
   /** Max elements to list. */
   limit?: number;
+  /** CSS selector: only snapshot inside this element (main frame). */
+  root?: string;
+  /** Only return lines matching this text (case-insensitive) or /regex/, with their landmarks. */
+  find?: string;
 }
 
 export interface FrameSnapshot {
@@ -247,12 +251,19 @@ export function snapshotInPage(opts: SnapshotOptions): FrameSnapshot {
       if (!hidden && sized && (!opts.viewportOnly || inViewport(rect))) {
         if (role && !(role === "clickable" && inInteractive)) {
           total++;
-          if (lines.length < limit) {
+          // An image-only link to a URL that also has a text link is noise (card thumbnails).
+          const dupThumb =
+            role === "link" && !((el as HTMLElement).innerText || "").trim() && textLinkHrefs.has((el as HTMLAnchorElement).href) && !el.getAttribute("aria-label");
+          if (dupThumb) {
+            // still reachable via the text link
+          } else if (lines.length < limit) {
             const r = refFor(el);
             let line = "- " + role;
             const nm = clip(name(el, role), 80);
             if (nm) line += " " + q(nm);
             line += " [" + r + "]" + valueOf(el, role) + states(el, role);
+            const h = headingOf.get(el);
+            if (h) line += " (" + h + ")";
             if (opts.urls && role === "link") {
               const href = (el as HTMLAnchorElement).href || "";
               line += " →" + href.replace(location.origin, "").slice(0, 80);
@@ -265,7 +276,10 @@ export function snapshotInPage(opts: SnapshotOptions): FrameSnapshot {
           if (t && lines.length < limit) lines.push("  ".repeat(indent) + "- " + (el.getAttribute("role") || "status") + " " + q(t));
         } else if (/^h[1-6]$/.test(tag) && !inInteractive) {
           const t = clip((el as HTMLElement).innerText || "", 80);
-          if (t && lines.length < limit) lines.push("  ".repeat(indent) + "- heading " + q(t) + " [" + tag + "]");
+          // <h3><a>Title</a></h3>: print one line — the link, tagged with its heading level.
+          const inner = el.querySelector("a[href],button");
+          if (inner && clip((inner as HTMLElement).innerText || "", 80) === t) headingOf.set(inner, tag);
+          else if (t && lines.length < limit) lines.push("  ".repeat(indent) + "- heading " + q(t) + " [" + tag + "]");
         } else if (mode === "full" && !inInteractive && (tag === "p" || tag === "li" || tag === "td" || tag === "th" || tag === "label" || tag === "blockquote" || tag === "figcaption" || tag === "dd" || tag === "dt")) {
           const t = clip((el as HTMLElement).innerText || "", 160);
           if (t && lines.length < limit && !el.querySelector("a,button,input,select,textarea")) lines.push("  ".repeat(indent) + "- text " + q(t));
@@ -279,12 +293,34 @@ export function snapshotInPage(opts: SnapshotOptions): FrameSnapshot {
       }
 
       const childInteractive = inInteractive || (!!role && role !== "clickable");
+      const before = lines.length;
       if (el.shadowRoot) walk(el.shadowRoot, indent, pointer, childInteractive);
       walk(el, indent, pointer || (!!role && role === "clickable"), childInteractive);
+      // Footers are link farms: keep the first few links, summarize the rest.
+      if ((lm === "footer" || el.getAttribute("role") === "contentinfo") && !opts.root && !opts.find) {
+        const items = lines.slice(before);
+        const links = items.filter((l) => /^\s*- link /.test(l));
+        if (links.length > 12) {
+          let kept = 0;
+          const out = items.filter((l) => !/^\s*- link /.test(l) || kept++ < 8);
+          out.push("  ".repeat(indent) + `- … ${links.length - 8} more footer links (snapshot root="footer" to list them)`);
+          for (let k = out.length - 2; k >= 0; k--) {
+            if (/^\s*- heading /.test(out[k]) && /^\s*- (heading |… )/.test(out[k + 1])) out.splice(k, 1);
+          }
+          lines.splice(before, items.length, ...out);
+        }
+      }
     }
   }
 
-  if (document.body) walk(document.body, 0, false, false);
+  const textLinkHrefs = new Set<string>();
+  document.querySelectorAll("a[href]").forEach((a) => {
+    if (((a as HTMLElement).innerText || "").trim()) textLinkHrefs.add((a as HTMLAnchorElement).href);
+  });
+  const headingOf = new WeakMap<Element, string>();
+  const start = opts.root ? document.querySelector(opts.root) : document.body;
+  if (opts.root && !start) throw new Error(`root selector matched nothing: ${opts.root}`);
+  if (start) walk(start, 0, false, false);
   return {
     lines,
     total,
@@ -348,6 +384,7 @@ export async function takeSnapshot(page: Page, opts: SnapshotOptions = {}): Prom
     const isMain = f === main;
     const id = frameId(f);
     try {
+      if (!isMain && opts.root) continue;
       const res = await f.evaluate(snapshotInPage, { ...opts, prefix: isMain ? "" : `f${id}` });
       if (isMain) {
         scroll = res.scroll;
@@ -364,11 +401,48 @@ export async function takeSnapshot(page: Page, opts: SnapshotOptions = {}): Prom
       // Frame navigated or is cross-origin and not yet ready — skip it.
     }
   }
-  lastSnapshots.set(page, { lines: all, url: page.url(), frames });
+  // Only a full default snapshot is a valid baseline for diffs; scoped or partial
+  // views would make the next diff report the rest of the page as "added".
+  const partial = !!opts.root || !!opts.viewportOnly || (opts.mode ?? "interactive") !== "interactive";
+  const prev = lastSnapshots.get(page);
+  if (!partial) lastSnapshots.set(page, { lines: all, url: page.url(), frames });
+  else if (prev) for (const [k, f] of frames) prev.frames.set(k, f);
+  else lastSnapshots.set(page, { lines: [], url: "", frames });
   const more = truncated ? ` (list truncated at ${opts.limit || 400}; use viewportOnly or scroll)` : "";
   const scrollInfo = scroll.h > scroll.vh ? ` scroll:${scroll.y}/${scroll.h - scroll.vh}px` : "";
   const header = `${total} actionable${more}${scrollInfo}`;
+  if (opts.find) {
+    const found = findLines(all, opts.find);
+    return { text: `${found.matches} match(es) for ${JSON.stringify(opts.find)} of ${total} actionable\n${found.lines.join("\n")}`, lines: all, total };
+  }
   return { text: header + "\n" + all.join("\n"), lines: all, total };
+}
+
+/** Lines matching `query`, each preceded by the landmark headers it sits under. */
+export function findLines(lines: string[], query: string): { lines: string[]; matches: number } {
+  const re = query.match(/^\/(.+)\/([a-z]*)$/);
+  const test = re ? ((s: string) => new RegExp(re[1], re[2] || "i").test(s)) : ((s: string) => s.toLowerCase().includes(query.toLowerCase()));
+  const out: string[] = [];
+  const emitted = new Set<number>();
+  let matches = 0;
+  lines.forEach((line, i) => {
+    if (/^\s*## /.test(line) || !test(line)) return;
+    matches++;
+    // Walk back to collect enclosing landmark headers (smaller indent).
+    const indent = line.search(/\S/);
+    const heads: number[] = [];
+    let want = indent;
+    for (let j = i - 1; j >= 0 && want > 0; j--) {
+      const ind = lines[j].search(/\S/);
+      if (/^\s*## /.test(lines[j]) && ind < want) {
+        heads.unshift(j);
+        want = ind;
+      }
+    }
+    for (const h of heads) if (!emitted.has(h)) (emitted.add(h), out.push(lines[h]));
+    out.push(line);
+  });
+  return { lines: out, matches };
 }
 
 /**

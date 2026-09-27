@@ -1,0 +1,12 @@
+{
+  "name": "browser-mcp-bench",
+  "private": true,
+  "type": "module",
+  "description": "Head-to-head benchmark: browser-mcp vs Playwright MCP vs Chrome DevTools MCP",
+  "scripts": { "bench": "node compare.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@playwright/mcp": "latest",
+    "chrome-devtools-mcp": "latest"
+  }
+}

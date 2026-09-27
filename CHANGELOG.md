@@ -2,6 +2,24 @@
 
 ## 3.0.0
 
+### Competitive round (after reviewing Playwright MCP, Chrome DevTools MCP, Firecrawl, Crawl4AI, agent-browser, Unbrowse, Browserbase)
+- `list_apis` / `call_api`: JSON XHR/fetch traffic is captured while browsing; endpoints can be called directly with the session's cookies and captured auth headers, with `select` field paths.
+- `macro`: actions are recorded with stable selectors (refs converted to `#id`, `[name=…]`, `:text-is()` or CSS paths); `save` with params, `run` with vars, no LLM needed.
+- `web_search` (DuckDuckGo HTML, SearXNG via `--search-url`, Brave via `BRAVE_API_KEY`), optionally scraping the top N results in the same call.
+- `extract_structured schema=` and `crawl schema=`: CSS-schema extraction (text, attribute, number, html, exists, list, nested, regex).
+- `crawl` is best-first when `query` is set; `scrape scroll=N` for infinite scroll; PDFs are converted to markdown.
+- `snapshot find=` (matching lines with their landmarks) and `root=` (scoped); `take_screenshot ifChanged`.
+- Snapshots merge headings into their links, drop thumbnail links that duplicate a text link, and fold footer link farms (−34% on a busy store page).
+- Response governor: `--secrets` / `BROWSER_SECRET_*` with `{{secret.NAME}}` placeholders masked in every response; `--max-response` spills oversized results to files (`--output-dir`).
+- `--allowed-domains` / `--blocked-domains` enforced on navigate, scraping and every top-level browser navigation; `--idle-timeout`.
+- `page_metrics` (devtools group): TTFB, FCP, LCP, CLS, long tasks, bytes by type, DOM size, errors.
+- MCP `readOnlyHint` annotations on read-only tools.
+- Default toolset `core,scrape,macros` (27 tools, ~4.6k schema tokens); `browser_connect`/`close_browser` moved to the `session` group.
+- Record lists are returned one compact JSON object per line.
+- `bench/`: reproducible head-to-head benchmark against Playwright MCP and Chrome DevTools MCP.
+
+### Initial v3
+
 Focus: lower token cost and latency for agents, plus built-in scraping.
 
 ### Added

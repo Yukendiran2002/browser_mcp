@@ -10,6 +10,12 @@ import { filterByQuery } from "../dist/content/bm25.js";
 import { extractStructured } from "../dist/content/structured.js";
 import { learn, applyRules, records, grouped, normalizeModel } from "../dist/content/dejavu.js";
 import { buildSelector } from "../dist/utils.js";
+import { extractBySchema } from "../dist/content/structured.js";
+import { selectJson, jsonShape, endpointTemplate } from "../dist/apis.js";
+import { parseDuckDuckGo } from "../dist/search.js";
+import { parameterize, instantiate, macroParams } from "../dist/macros.js";
+import { findLines } from "../dist/snapshot.js";
+import { configurePolicy, denyReason } from "../dist/policy.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const doc = (name) => parseDocument(readFileSync(join(fixtures, name), "utf8"));
@@ -114,4 +120,59 @@ test("buildSelector treats tag names as CSS and words as text", () => {
   assert.equal(buildSelector("//div[@id='x']"), "xpath=//div[@id='x']");
   assert.equal(buildSelector("Sign in"), 'text="Sign in"');
   assert.equal(buildSelector("role=button[name=\"Go\"]"), 'role=button[name="Go"]');
+});
+
+test("schema extraction supports attributes, numbers, lists and regex", () => {
+  const recs = extractBySchema(doc("products.html"), BASE, {
+    baseSelector: ".product",
+    fields: [
+      { name: "name", selector: "h2" },
+      { name: "url", selector: "h2 a", type: "attribute", attribute: "href" },
+      { name: "price", selector: ".price", type: "number" },
+      { name: "stars", selector: ".rating", type: "attribute", attribute: "aria-label", regex: "([\\d.]+) out of" },
+      { name: "featured", selector: ":scope.featured", type: "exists" },
+    ],
+  });
+  assert.equal(recs.length, 4);
+  assert.deepEqual(recs[1], { name: "Samsung Galaxy S24", url: "https://gadget.example/p/galaxy-s24", price: 899, stars: "4.4", featured: false });
+});
+
+test("JSON select paths, shapes and endpoint templates", () => {
+  const data = { data: { items: [{ id: 1, name: "a", price: 2 }, { id: 2, name: "b", price: 3 }] }, total: 2 };
+  assert.deepEqual(selectJson(data, "data.items[*].name"), ["a", "b"]);
+  assert.deepEqual(selectJson(data, "data.items[*].{name,price}"), [{ name: "a", price: 2 }, { name: "b", price: 3 }]);
+  assert.deepEqual(selectJson(data, "data.items[1].id"), 2);
+  assert.equal(jsonShape(data), "{data:{items:[2]{id:num,name:str,price:num}},total:num}");
+  assert.equal(endpointTemplate("GET", "https://x.io/api/users/12345/posts?page=2&q=a"), "GET x.io/api/users/{id}/posts?page=&q=");
+});
+
+test("DuckDuckGo results parser skips ads and unwraps redirects", () => {
+  const r = parseDuckDuckGo(readFileSync(join(fixtures, "ddg.html"), "utf8"));
+  assert.deepEqual(r.map((x) => x.url), ["https://playwright.dev/", "https://github.com/microsoft/playwright"]);
+  assert.match(r[0].title, /Fast and reliable/);
+  assert.match(r[0].snippet, /rendering engines/);
+});
+
+test("macro parameters round-trip", () => {
+  const steps = [{ action: "navigate", url: "https://s.example/search?q=laptops" }, { action: "fill", selector: "#q", text: "laptops" }];
+  const p = parameterize(steps, { query: "laptops" });
+  assert.deepEqual(macroParams(p), ["query"]);
+  assert.equal(instantiate(p, { query: "phones" })[0].url, "https://s.example/search?q=phones");
+  assert.throws(() => instantiate(p, {}), /Missing macro variable "query"/);
+});
+
+test("snapshot find keeps enclosing landmarks", () => {
+  const lines = ["## header", "  - link \"Home\" [e1]", "## main", "  ## form", "    - textbox \"Email\" [e2]", "    - button \"Go\" [e3]"];
+  assert.deepEqual(findLines(lines, "email").lines, ["## main", "  ## form", "    - textbox \"Email\" [e2]"]);
+  assert.equal(findLines(lines, "/e[13]\\]/").matches, 2);
+});
+
+test("domain policy", () => {
+  configurePolicy("example.com,*.docs.io", "bad.example.com");
+  assert.equal(denyReason("https://example.com/x"), null);
+  assert.equal(denyReason("https://api.example.com/x"), null);
+  assert.equal(denyReason("https://a.docs.io/"), null);
+  assert.match(denyReason("https://bad.example.com/"), /blocked/);
+  assert.match(denyReason("https://other.org/"), /not in --allowed-domains/);
+  configurePolicy();
 });

@@ -13,6 +13,7 @@
 import { fetch as undiciFetch, ProxyAgent, EnvHttpProxyAgent, type Dispatcher } from "undici";
 import type { Page, Route } from "playwright";
 import { BrowserManager, chromeUserAgent } from "./browser-manager.js";
+import { assertAllowed } from "./policy.js";
 import { parseDocument } from "./content/dom.js";
 import { htmlToMarkdown, type MarkdownOptions } from "./content/markdown.js";
 import { filterByQuery } from "./content/bm25.js";
@@ -41,6 +42,8 @@ export interface ScrapeOptions {
   query?: string;
   maxChars?: number;
   waitFor?: string;
+  /** Browser only: scroll to the bottom up to N times to load infinite-scroll / lazy content. */
+  scroll?: number;
   timeout?: number;
   structured?: StructuredKind[] | boolean;
   includeHtml?: boolean;
@@ -181,6 +184,9 @@ export class Scraper {
     const len = parseInt(res.headers.get("content-length") || "0", 10);
     if (len > 15_000_000) throw new Error(`Response too large (${len} bytes)`);
     const buf = Buffer.from(await res.arrayBuffer());
+    if (/application\/pdf/i.test(contentType) || buf.subarray(0, 5).toString("latin1") === "%PDF-") {
+      return { url, finalUrl: res.url || url, status: res.status, contentType: "text/markdown; source=pdf", html: await pdfToMarkdown(buf), via: "http", ms: Date.now() - t0 };
+    }
     let charset = (contentType.match(/charset=([\w-]+)/i) || [])[1];
     if (!charset) {
       const head = buf.subarray(0, 2048).toString("latin1");
@@ -227,7 +233,7 @@ export class Scraper {
         await page.route("**/*", (route: Route) => {
           const req = route.request();
           if (BLOCK_TYPES.has(req.resourceType()) || TRACKERS.test(req.url())) return route.abort();
-          return route.continue();
+          return route.fallback();
         });
       }
       return page;
@@ -259,6 +265,18 @@ export class Scraper {
           .catch(() => {});
         await page.waitForLoadState("domcontentloaded").catch(() => {});
       }
+      if (opts.scroll) {
+        // Infinite scroll / lazy loading: scroll until the page stops growing.
+        for (let i = 0; i < Math.min(opts.scroll, 50); i++) {
+          const h0 = await page.evaluate(() => document.documentElement.scrollHeight);
+          await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+          const grew = await page
+            .waitForFunction((h: number) => document.documentElement.scrollHeight > h, h0, { timeout: 2_500, polling: 100 })
+            .then(() => true)
+            .catch(() => false);
+          if (!grew) break;
+        }
+      }
       if (opts.waitFor) {
         await page.waitForSelector(opts.waitFor, { timeout: Math.min(timeout, 15_000) }).catch(() => {});
       } else {
@@ -286,6 +304,7 @@ export class Scraper {
   // ─── Unified fetch ─────────────────────────────────────────
 
   async fetch(url: string, opts: ScrapeOptions = {}, md?: MarkdownOptions): Promise<Fetched & { note?: string }> {
+    assertAllowed(url);
     const key = normalizeUrl(url);
     if (!opts.noCache) {
       const hit = this.cache.get(key);
@@ -306,7 +325,7 @@ export class Scraper {
     this.hostStats.set(host, stats);
     // Skip the HTTP probe for hosts that keep needing a browser.
     const preferBrowser = stats.escalated >= 2 && stats.escalated > stats.ok;
-    if (mode === "browser" || !this.httpAllowed() || (mode === "auto" && preferBrowser)) {
+    if (mode === "browser" || opts.scroll || !this.httpAllowed() || (mode === "auto" && preferBrowser)) {
       result = await this.fetchBrowser(url, opts, md);
     } else {
       let http: Fetched | null = null;
@@ -348,10 +367,17 @@ export class Scraper {
       const f = await this.fetch(url, opts, mdOpts);
       const res: ScrapeResult = { url, finalUrl: f.finalUrl, status: f.status, via: f.cached ? `${f.via} (cached)` : f.via, ms: Date.now() - t0, title: "", note: f.note };
       if (f.contentType && !/html|xml/i.test(f.contentType)) {
-        // JSON, plain text, etc. — return as-is.
-        const text = f.html;
-        res.markdown = text.slice(0, opts.maxChars ?? 8000);
+        // PDF (already converted), JSON, plain text — return as text, still query-filterable.
+        let text = f.html;
+        const max = opts.maxChars ?? 8000;
         res.totalChars = text.length;
+        if (/source=pdf/.test(f.contentType)) res.title = decodeURIComponent(new URL(f.finalUrl).pathname.split("/").pop() || "PDF");
+        if (opts.query) {
+          const filtered = filterByQuery(text, opts.query, max);
+          text = filtered.markdown || "(no section matched the query)";
+          res.note = [res.note, `query kept ${filtered.kept}/${filtered.total} sections`].filter(Boolean).join("; ");
+        }
+        res.markdown = text.length > max ? text.slice(0, max) + `\n…(truncated, ${res.totalChars} chars total)` : text;
         return { result: res, doc: null };
       }
       const doc = parseDocument(f.html);
@@ -378,6 +404,25 @@ export class Scraper {
     } catch (e: any) {
       return { result: { url, finalUrl: url, status: 0, via: "-", ms: Date.now() - t0, title: "", error: e.message }, doc: null };
     }
+  }
+
+  /** Links with their anchor text (first text seen per URL). */
+  linksWithText(doc: any, base: string): { url: string; text: string }[] {
+    const out = new Map<string, string>();
+    const as = doc.querySelectorAll("a[href]");
+    for (let i = 0; i < as.length; i++) {
+      const href = as[i].getAttribute("href");
+      if (!href || /^(javascript|mailto|tel|data):/i.test(href) || href.startsWith("#")) continue;
+      try {
+        const u = new URL(href, base);
+        if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+        const key = normalizeUrl(u.href);
+        if (!out.has(key)) out.set(key, (as[i].textContent || "").replace(/\s+/g, " ").trim().slice(0, 120));
+      } catch {
+        /* ignore */
+      }
+    }
+    return [...out].map(([url, text]) => ({ url, text }));
   }
 
   linksOf(doc: any, base: string): string[] {
@@ -439,6 +484,8 @@ export class Scraper {
       concurrency?: number;
       respectRobots?: boolean;
       scrape?: ScrapeOptions;
+      /** Best-first: visit links whose anchor text / URL match these words first. */
+      prioritize?: string;
     },
     onPage: (r: ScrapeResult, doc: any | null, depth: number) => Promise<void> | void
   ): Promise<{ visited: number; failed: number; skipped: number }> {
@@ -448,7 +495,13 @@ export class Scraper {
     const inc = (opts.include || []).map((p) => new RegExp(p, "i"));
     const exc = (opts.exclude || []).map((p) => new RegExp(p, "i"));
     const seen = new Set<string>([normalizeUrl(start)]);
-    const queue: { url: string; depth: number }[] = [{ url: normalizeUrl(start), depth: 0 }];
+    const queue: { url: string; depth: number; score: number }[] = [{ url: normalizeUrl(start), depth: 0, score: 0 }];
+    const terms = (opts.prioritize || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 2);
+    const scoreLink = (url: string, text: string) => {
+      if (!terms.length) return 0;
+      const hay = (text + " " + decodeURIComponent(url)).toLowerCase();
+      return terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
+    };
     let visited = 0;
     let failed = 0;
     let skipped = 0;
@@ -483,14 +536,18 @@ export class Scraper {
           }
           visited++;
           if (doc && item.depth < maxDepth) {
-            for (const link of this.linksOf(doc, r.finalUrl)) {
+            for (const { url: link, text } of this.linksWithText(doc, r.finalUrl)) {
               if (seen.has(link) || SKIP_EXT.test(new URL(link).pathname)) continue;
               const lu = new URL(link);
               if (opts.sameDomain !== false && lu.host !== origin.host) continue;
               if (inc.length && !inc.some((re) => re.test(link))) continue;
               if (exc.some((re) => re.test(link))) continue;
               seen.add(link);
-              queue.push({ url: link, depth: item.depth + 1 });
+              queue.push({ url: link, depth: item.depth + 1, score: scoreLink(link, text) });
+            }
+            if (terms.length) {
+              // Best-first: most relevant links next, shallower first on ties.
+              queue.sort((a, b) => b.score - a.score || a.depth - b.depth);
             }
           }
           await onPage(r, doc, item.depth);
@@ -564,4 +621,13 @@ export class Scraper {
     for (const p of this.idlePages) await p.close().catch(() => {});
     this.idlePages = [];
   }
+}
+
+/** Extract text from a PDF as markdown with page headings. */
+export async function pdfToMarkdown(buf: Buffer): Promise<string> {
+  const { getDocumentProxy, extractText } = await import("unpdf");
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  const { totalPages, text } = await extractText(pdf, { mergePages: false });
+  const pages = (text as string[]).map((t, i) => `## Page ${i + 1}\n\n${t.replace(/[ \t]+\n/g, "\n").trim()}`);
+  return `(PDF, ${totalPages} pages)\n\n` + pages.join("\n\n");
 }

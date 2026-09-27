@@ -13,6 +13,8 @@ import {
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { spawn, ChildProcess } from "node:child_process";
 import { getDevicePreset, DevicePreset, DEVICE_PRESETS } from "./devices.js";
+import { policyActive, denyReason } from "./policy.js";
+import { captureApis, type ApiCall } from "./apis.js";
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -142,6 +144,7 @@ export class BrowserManager {
   // Tracking infrastructure
   private consoleLogs: Map<number, ConsoleLogEntry[]> = new Map();
   private networkLogs: Map<number, NetworkLogEntry[]> = new Map();
+  private apiCalls: Map<number, ApiCall[]> = new Map();
   private blockedPatterns: string[] = [];
   private isRecordingVideo = false;
   private chromeProcess: ChildProcess | null = null;
@@ -456,6 +459,16 @@ export class BrowserManager {
 
   /** Register existing and future pages of a context. */
   private attachContext(ctx: BrowserContext): void {
+    if (policyActive()) {
+      // Enforce the domain policy on every top-level navigation (links, redirects, window.open).
+      ctx
+        .route("**/*", (route) => {
+          const req = route.request();
+          if (req.isNavigationRequest() && denyReason(req.url())) return route.abort("blockedbyclient");
+          return route.fallback();
+        })
+        .catch(() => {});
+    }
     for (const page of ctx.pages()) this.activePageId = this.registerPage(page);
     ctx.on("page", (page) => {
       if (this.internalPages.has(page)) return;
@@ -504,8 +517,26 @@ export class BrowserManager {
     return id;
   }
 
+  private lastUsed = Date.now();
+  private idleTimer: NodeJS.Timeout | null = null;
+
+  /** Close a browser we launched after `ms` without tool activity (0 disables). CDP-attached browsers are left alone. */
+  setIdleTimeout(ms: number): void {
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = null;
+    if (ms <= 0) return;
+    this.idleTimer = setInterval(() => {
+      if (this.context && !this.viaCdp && Date.now() - this.lastUsed > ms) {
+        console.error("[browser-mcp] idle timeout — closing browser (reopens on next use)");
+        this.close().catch(() => {});
+      }
+    }, Math.min(ms, 30_000));
+    this.idleTimer.unref();
+  }
+
   /** Connect on first use so agents don't need an explicit browser_connect call. */
   async ensureContext(): Promise<BrowserContext> {
+    this.lastUsed = Date.now();
     if (this.context) return this.context;
     if (!this.connecting) {
       this.connecting = this.connect().finally(() => {
@@ -594,6 +625,11 @@ export class BrowserManager {
     };
     page.on("response", (response: Response) => record(response.request(), response.status()));
     page.on("requestfailed", (request: Request) => record(request, 0));
+
+    // JSON XHR/fetch responses for list_apis / call_api.
+    const apis: ApiCall[] = [];
+    this.apiCalls.set(pageId, apis);
+    captureApis(page, apis);
 
     page.on("close", () => {
       this.consoleLogs.delete(pageId);
@@ -732,6 +768,15 @@ export class BrowserManager {
 
   clearConsoleLogs(pageId: number): void {
     this.consoleLogs.set(pageId, []);
+  }
+
+  getApiCalls(pageId: number): ApiCall[] {
+    return this.apiCalls.get(pageId) || [];
+  }
+
+  /** All captured API calls across tabs, newest last. */
+  getAllApiCalls(): ApiCall[] {
+    return [...this.apiCalls.values()].flat().sort((a, b) => a.at - b.at);
   }
 
   getNetworkLogs(pageId: number): NetworkLogEntry[] {

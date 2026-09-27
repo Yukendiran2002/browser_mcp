@@ -1,10 +1,15 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
+import type { Page } from "playwright";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { BrowserManager } from "../browser-manager.js";
 import { takeSnapshot } from "../snapshot.js";
 import { htmlToMarkdown } from "../content/markdown.js";
 import { filterByQuery } from "../content/bm25.js";
 import { setHumanMode } from "../human.js";
+import { assertAllowed } from "../policy.js";
+import { isRef } from "../snapshot.js";
+import { recorder, MacroStore, parameterize, instantiate, macroParams } from "../macros.js";
 import { mustLocate } from "../utils.js";
 import { performStep, STEP_ACTIONS, type Step } from "./actions.js";
 import { ok, fail, settle, actionReport, pageInfo, truncate, normalizeInputUrl, type SnapshotReturn, type ToolResult } from "./helpers.js";
@@ -17,16 +22,56 @@ const snapshotParam = z.enum(["diff", "full", "none"]).optional().describe("Resu
  * Core browsing tools: ref-based snapshots, actions that report their own effects,
  * and batching so multi-step flows cost one round trip.
  */
-export function registerCoreTools(server: McpServer, browser: BrowserManager): void {
+const lastShot = new WeakMap<Page, string>();
+
+export function registerCoreTools(server: McpServer, browser: BrowserManager, macros: MacroStore): void {
   /** Run one action with settle + effect report. */
+  const record = (s: Step) => recorder.push(s);
+
   async function act(pid: number | undefined, step: Step, snap: SnapshotReturn | undefined): Promise<ToolResult> {
     try {
       const { id, page } = await browser.getOrCreatePage(pid);
-      const { navigated, result } = await settle(page, () => performStep(page, step));
+      const { navigated, result } = await settle(page, () => performStep(page, step, 5_000, record));
       const report = await actionReport(browser, page, id, navigated || step.action === "navigate", snap ?? "diff");
       return ok(report ? `${result}\n${report}` : result);
     } catch (e: any) {
       return fail(`${step.action} failed: ${e.message.split("\n")[0]}`);
+    }
+  }
+
+  /** Run steps in order with settle + effect report (used by batch and macro run). */
+  async function runSteps(pid: number | undefined, steps: Step[], continueOnError: boolean, snapshot?: SnapshotReturn): Promise<ToolResult> {
+    try {
+      const { id, page: first } = await browser.getOrCreatePage(pid);
+      let page = first;
+      let navigated = false;
+      const lines: string[] = [];
+      let failed = false;
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        try {
+          const r = await settle(page, () => performStep(page, step, 5_000, record));
+          navigated = navigated || r.navigated || step.action === "navigate";
+          lines.push(`${i + 1}. ✓ ${r.result}`);
+          // Follow a tab the step opened.
+          const active = browser.getActivePageId();
+          if (active !== null && active !== id && pid === undefined) {
+            page = (await browser.getOrCreatePage(active)).page;
+          }
+        } catch (e: any) {
+          failed = true;
+          lines.push(`${i + 1}. ✗ ${step.action}: ${e.message.split("\n")[0]}`);
+          if (!continueOnError) {
+            if (i < steps.length - 1) lines.push(`(stopped; ${steps.length - i - 1} step(s) not run)`);
+            break;
+          }
+        }
+      }
+      const report = await actionReport(browser, page, browser.getActivePageId() ?? id, navigated, snapshot ?? "diff");
+      const out = lines.join("\n") + (report ? "\n" + report : "");
+      return failed && !continueOnError ? fail(out) : ok(out);
+    } catch (e: any) {
+      return fail(`batch failed: ${e.message}`);
     }
   }
 
@@ -76,6 +121,7 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
       try {
         const { id, page } = await browser.getOrCreatePage(pid);
         url = normalizeInputUrl(url);
+        assertAllowed(url);
         const resp = await page.goto(url, { waitUntil: waitUntil ?? "domcontentloaded", timeout: 30_000 });
         const status = resp ? ` · ${resp.status()}` : "";
         const head = pageInfo(id, page.url(), await page.title().catch(() => "")) + status;
@@ -107,12 +153,14 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
       mode: z.enum(["interactive", "full"]).optional().describe("full adds text blocks"),
       viewportOnly: z.boolean().optional(),
       urls: z.boolean().optional().describe("Show link targets"),
+      find: z.string().optional().describe("Only lines matching text or /regex/"),
+      root: z.string().optional().describe("CSS region to snapshot"),
       maxChars: z.number().optional(),
     },
-    async ({ pageId: pid, mode, viewportOnly, urls, maxChars }) => {
+    async ({ pageId: pid, mode, viewportOnly, urls, find, root, maxChars }) => {
       try {
         const { id, page } = await browser.getOrCreatePage(pid);
-        const snap = await takeSnapshot(page, { mode, viewportOnly, urls });
+        const snap = await takeSnapshot(page, { mode, viewportOnly, urls, find, root });
         const head = pageInfo(id, page.url(), await page.title().catch(() => ""));
         return ok(`${head}\n${truncate(snap.text, maxChars ?? 12_000)}`);
       } catch (e: any) {
@@ -169,9 +217,9 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
             const el = await mustLocate(page, f.selector);
             const kind = await el.evaluate((n: any) => (n.tagName === "SELECT" ? "select" : n.type === "checkbox" || n.type === "radio" ? "check" : "text"));
             const last = i === fields.length - 1;
-            if (kind === "select") done.push(await performStep(page, { action: "select", selector: f.selector, value: f.value }));
-            else if (kind === "check") done.push(await performStep(page, { action: /^(false|0|off|no)$/i.test(f.value) ? "uncheck" : "check", selector: f.selector }));
-            else done.push(await performStep(page, { action: "fill", selector: f.selector, text: f.value, submit: submit && last }));
+            if (kind === "select") done.push(await performStep(page, { action: "select", selector: f.selector, value: f.value }, 5_000, record));
+            else if (kind === "check") done.push(await performStep(page, { action: /^(false|0|off|no)$/i.test(f.value) ? "uncheck" : "check", selector: f.selector }, 5_000, record));
+            else done.push(await performStep(page, { action: "fill", selector: f.selector, text: f.value, submit: submit && last }, 5_000, record));
           }
           return `filled ${fields.length} field(s)${submit ? " + submitted" : ""}`;
         });
@@ -276,13 +324,11 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
             ms: z.number().optional(),
             direction: z.enum(["up", "down", "left", "right", "top", "bottom"]).optional(),
             amount: z.number().optional(),
-            clear: z.boolean().optional(),
             submit: z.boolean().optional(),
             to: z.string().optional(),
             files: z.array(z.string()).optional(),
             script: z.string().optional(),
             gone: z.boolean().optional(),
-            timeout: z.number().optional(),
           })
         )
         .min(1)
@@ -291,38 +337,65 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
       continueOnError: z.boolean().optional(),
       snapshot: snapshotParam,
     },
-    async ({ steps, pageId: pid, continueOnError, snapshot }) => {
+    async ({ steps, pageId: pid, continueOnError, snapshot }) => runSteps(pid, steps as Step[], !!continueOnError, snapshot)
+  );
+
+  server.tool(
+    "macro",
+    "Replay flows without LLM reasoning. Your actions are recorded automatically: save turns recent steps into a named macro (params turns example values into variables); run replays it with vars.",
+    {
+      action: z.enum(["save", "run", "list", "show", "delete", "clear"]),
+      name: z.string().optional(),
+      last: z.number().optional().describe("save: only the last N recorded steps"),
+      params: z.record(z.string()).optional().describe('save: {"query":"laptops"} → {{query}}'),
+      vars: z.record(z.string()).optional().describe("run: values for params"),
+      pageId,
+    },
+    async ({ action, name, last, params, vars, pageId: pid }) => {
       try {
-        const { id, page: first } = await browser.getOrCreatePage(pid);
-        let page = first;
-        let navigated = false;
-        const lines: string[] = [];
-        let failed = false;
-        for (let i = 0; i < steps.length; i++) {
-          const step = steps[i] as Step;
-          try {
-            const r = await settle(page, () => performStep(page, step));
-            navigated = navigated || r.navigated || step.action === "navigate";
-            lines.push(`${i + 1}. ✓ ${r.result}`);
-            // Follow a tab the step opened.
-            const active = browser.getActivePageId();
-            if (active !== null && active !== id && pid === undefined) {
-              page = (await browser.getOrCreatePage(active)).page;
-            }
-          } catch (e: any) {
-            failed = true;
-            lines.push(`${i + 1}. ✗ ${step.action}: ${e.message.split("\n")[0]}`);
-            if (!continueOnError) {
-              if (i < steps.length - 1) lines.push(`(stopped; ${steps.length - i - 1} step(s) not run)`);
-              break;
-            }
-          }
+        if (action === "clear") {
+          recorder.steps = [];
+          return ok("Recording cleared");
         }
-        const report = await actionReport(browser, page, browser.getActivePageId() ?? id, navigated, snapshot ?? "diff");
-        const out = lines.join("\n") + (report ? "\n" + report : "");
-        return failed && !continueOnError ? fail(out) : ok(out);
+        if (action === "list") {
+          const l = macros.list();
+          return ok(l.length ? l.map((m) => `${m.name}(${m.params.join(", ")}): ${m.steps.length} steps`).join("\n") : `No macros (${macros.dir})`);
+        }
+        if (action === "show" && !name) {
+          return ok(recorder.steps.length ? recorder.steps.map((s, i) => `${i + 1}. ${JSON.stringify(s)}`).join("\n") : "Nothing recorded yet");
+        }
+        if (!name) return fail("name is required");
+        if (action === "save") {
+          const steps = last ? recorder.steps.slice(-last) : recorder.steps.slice();
+          if (!steps.length) return fail("Nothing recorded yet — perform the flow first (navigate/click/type/batch).");
+          const unstable = steps.filter((s) => (s.selector && isRef(s.selector)) || (s.to && isRef(s.to)));
+          const p = parameterize(steps, params || {});
+          const m = { name, params: macroParams(p), steps: p, created: new Date().toISOString() };
+          const path = macros.save(m);
+          return ok(
+            `Saved macro "${name}" (${p.length} steps, params: ${m.params.join(", ") || "none"}) → ${path}` +
+              (unstable.length ? `\nwarning: ${unstable.length} step(s) inside iframes kept snapshot refs and may not replay` : "") +
+              `\n${p.map((s, i) => `${i + 1}. ${JSON.stringify(s)}`).join("\n")}`
+          );
+        }
+        if (action === "show") {
+          const m = macros.load(name);
+          return ok(`${m.name}(${m.params.join(", ")})\n${m.steps.map((s, i) => `${i + 1}. ${JSON.stringify(s)}`).join("\n")}`);
+        }
+        if (action === "delete") {
+          macros.delete(name);
+          return ok(`Deleted macro ${name}`);
+        }
+        const m = macros.load(name);
+        const steps = instantiate(m.steps, vars || {});
+        recorder.paused = true;
+        try {
+          return await runSteps(pid, steps, false, "none");
+        } finally {
+          recorder.paused = false;
+        }
       } catch (e: any) {
-        return fail(`batch failed: ${e.message}`);
+        return fail(`macro ${action} failed: ${e.message}`);
       }
     }
   );
@@ -369,14 +442,19 @@ export function registerCoreTools(server: McpServer, browser: BrowserManager): v
       format: z.enum(["jpeg", "png"]).optional(),
       quality: z.number().optional(),
       path: z.string().optional().describe("Save to file"),
+      ifChanged: z.boolean().optional().describe("Skip the image if identical to the last one"),
     },
-    async ({ pageId: pid, selector: sel, fullPage, format, quality, path }) => {
+    async ({ pageId: pid, selector: sel, fullPage, format, quality, path, ifChanged }) => {
       try {
         const { page } = await browser.getOrCreatePage(pid);
         const type = format ?? "jpeg";
         const opts: any = { type, path, scale: "css", ...(type === "jpeg" ? { quality: quality ?? 60 } : {}) };
         const buffer = sel ? await (await mustLocate(page, sel)).screenshot(opts) : await page.screenshot({ ...opts, fullPage: fullPage ?? false });
         if (path) return ok(`Saved ${path} (${Math.round(buffer.length / 1024)} KB)`);
+        const hash = createHash("sha1").update(buffer).digest("hex");
+        const prev = lastShot.get(page);
+        lastShot.set(page, hash);
+        if (ifChanged && prev === hash) return ok("Screenshot unchanged since the last one (image omitted)");
         return { content: [{ type: "image" as const, data: buffer.toString("base64"), mimeType: `image/${type}` }] };
       } catch (e: any) {
         return fail(`Screenshot failed: ${e.message}`);

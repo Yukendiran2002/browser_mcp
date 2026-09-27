@@ -1,6 +1,10 @@
-import type { Page } from "playwright";
+import type { Page, ElementHandle } from "playwright";
 import { mustLocate, locate } from "../utils.js";
+import { isRef } from "../snapshot.js";
+import { stableSelector } from "../macros.js";
 import { clickHandle, typeInto, describe, truncate, normalizeInputUrl } from "./helpers.js";
+import { resolveSecrets } from "../governor.js";
+import { assertAllowed } from "../policy.js";
 import { humanHover, humanScroll, isHumanMode } from "../human.js";
 
 /** One browser action. Used by the individual tools and by `batch`. */
@@ -38,11 +42,37 @@ function need<T>(v: T | undefined, name: string, action: string): T {
 }
 
 /** Perform a step and return a one-line confirmation. Throws on failure. */
-export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): Promise<string> {
+type Finder = (selector: string, timeout: number, required?: boolean) => Promise<ElementHandle | null>;
+
+/**
+ * Perform a step and return a one-line confirmation. Throws on failure.
+ * `record` receives a replayable copy of the step: snapshot refs (which only live
+ * as long as the page) are swapped for stable selectors, so the step can be saved
+ * in a macro and replayed later.
+ */
+export async function performStep(page: Page, s: Step, defaultTimeout = 5_000, record?: (step: Step) => void): Promise<string> {
+  const stable = new Map<string, string>();
+  const find: Finder = async (sel, timeout, required = true) => {
+    const el = required ? await mustLocate(page, sel, timeout) : await locate(page, sel, timeout);
+    if (el && record && isRef(sel)) stable.set(sel, await stableSelector(el));
+    return el;
+  };
+  const text = await runStep(page, s, defaultTimeout, find);
+  if (record) {
+    const r: Step = { ...s };
+    if (s.selector) r.selector = stable.get(s.selector) ?? s.selector;
+    if (s.to) r.to = stable.get(s.to) ?? s.to;
+    record(r);
+  }
+  return text;
+}
+
+async function runStep(page: Page, s: Step, defaultTimeout: number, find: Finder): Promise<string> {
   const t = s.timeout ?? defaultTimeout;
   switch (s.action) {
     case "navigate": {
-      const url = normalizeInputUrl(need(s.url, "url", "navigate"));
+      const url = normalizeInputUrl(resolveSecrets(need(s.url, "url", "navigate")));
+      assertAllowed(url);
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: s.timeout ?? 30_000 });
       return `navigated ${page.url()}`;
     }
@@ -56,7 +86,7 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
       await page.reload({ waitUntil: "domcontentloaded" });
       return "reloaded";
     case "click": {
-      const el = await mustLocate(page, need(s.selector, "selector", "click"), t);
+      const el = (await find(need(s.selector, "selector", "click"), t))!;
       const what = await describe(el);
       const note = await clickHandle(page, el, { button: s.button, clickCount: s.double ? 2 : 1 });
       return `clicked ${what}${note}`;
@@ -64,14 +94,14 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
     case "type":
     case "fill": {
       const text = need(s.text ?? s.value, "text", s.action);
-      const el = s.selector ? await mustLocate(page, s.selector, t) : null;
+      const el = s.selector ? (await find(s.selector, t))! : null;
       const secret = el ? await el.evaluate((n: any) => n.type === "password").catch(() => false) : false;
-      await typeInto(page, el, text, { clear: s.action === "fill" || !!s.clear, submit: s.submit });
-      const shown = secret ? "••••" : truncate(text, 40);
+      await typeInto(page, el, resolveSecrets(text), { clear: s.action === "fill" || !!s.clear, submit: s.submit });
+      const shown = secret && !/\{\{\s*secret\./.test(text) ? "••••" : truncate(text, 40);
       return `typed "${shown}"${el ? ` into ${await describe(el)}` : ""}${s.submit ? " + Enter" : ""}`;
     }
     case "select": {
-      const el = await mustLocate(page, need(s.selector, "selector", "select"), t);
+      const el = (await find(need(s.selector, "selector", "select"), t))!;
       const v = need(s.value ?? s.text, "value", "select");
       let picked: string[] = [];
       try {
@@ -91,7 +121,7 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
     }
     case "check":
     case "uncheck": {
-      const el = await mustLocate(page, need(s.selector, "selector", s.action), t);
+      const el = (await find(need(s.selector, "selector", s.action), t))!;
       try {
         if (s.action === "check") await el.check({ timeout: 3_000 });
         else await el.uncheck({ timeout: 3_000 });
@@ -101,7 +131,7 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
       return `${s.action}ed ${await describe(el)}`;
     }
     case "hover": {
-      const el = await mustLocate(page, need(s.selector, "selector", "hover"), t);
+      const el = (await find(need(s.selector, "selector", "hover"), t))!;
       if (isHumanMode()) {
         await el.scrollIntoViewIfNeeded().catch(() => {});
         const box = await el.boundingBox();
@@ -113,13 +143,13 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
     }
     case "press": {
       const key = need(s.key ?? s.text, "key", "press");
-      if (s.selector) await (await mustLocate(page, s.selector, t)).focus();
+      if (s.selector) await ((await find(s.selector, t))!).focus();
       await page.keyboard.press(key);
       return `pressed ${key}`;
     }
     case "scroll": {
       if (s.selector && !s.direction) {
-        const el = await mustLocate(page, s.selector, t);
+        const el = (await find(s.selector, t))!;
         await el.scrollIntoViewIfNeeded();
         return `scrolled to ${await describe(el)}`;
       }
@@ -132,7 +162,7 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
       const dx = dir === "right" ? px : dir === "left" ? -px : 0;
       const dy = dir === "down" ? px : dir === "up" ? -px : 0;
       if (s.selector) {
-        const el = await mustLocate(page, s.selector, t);
+        const el = (await find(s.selector, t))!;
         await el.evaluate((n: Element, d: { dx: number; dy: number }) => n.scrollBy(d.dx, d.dy), { dx, dy });
       } else {
         await humanScroll(page, dy, dx);
@@ -152,11 +182,11 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
       }
       if (s.selector) {
         if (s.gone) {
-          const el = await locate(page, s.selector, 0);
+          const el = await find(s.selector, 0, false);
           if (el) await el.waitForElementState("hidden", { timeout });
           return `gone: ${s.selector}`;
         }
-        const el = await locate(page, s.selector, timeout);
+        const el = await find(s.selector, timeout, false);
         if (!el) throw new Error(`Timed out waiting for ${s.selector}`);
         return `found: ${s.selector}`;
       }
@@ -169,14 +199,14 @@ export async function performStep(page: Page, s: Step, defaultTimeout = 5_000): 
       return "network idle";
     }
     case "upload": {
-      const el = await mustLocate(page, need(s.selector, "selector", "upload"), t);
+      const el = (await find(need(s.selector, "selector", "upload"), t))!;
       const files = need(s.files, "files", "upload");
       await el.setInputFiles(files);
       return `uploaded ${files.length} file(s)`;
     }
     case "drag": {
-      const src = await mustLocate(page, need(s.selector, "selector", "drag"), t);
-      const dst = await mustLocate(page, need(s.to, "to", "drag"), t);
+      const src = (await find(need(s.selector, "selector", "drag"), t))!;
+      const dst = (await find(need(s.to, "to", "drag"), t))!;
       const a = await src.boundingBox();
       const b = await dst.boundingBox();
       if (!a || !b) throw new Error("drag: element not visible");

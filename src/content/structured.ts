@@ -422,3 +422,71 @@ export function extractStructured(doc: any, base: string, kinds: StructuredKind[
   if (want.has("feeds")) put("feeds", extractFeeds(doc, base));
   return out;
 }
+
+// ─── Schema extraction (CSS selectors, no LLM) ───────────────
+
+export interface SchemaField {
+  name: string;
+  /** CSS selector relative to the item; omit to use the item itself. */
+  selector?: string;
+  /** text (default) | attribute | html | list | nested | exists | number */
+  type?: "text" | "attribute" | "html" | "list" | "nested" | "exists" | "number";
+  attribute?: string;
+  /** Sub-fields for list/nested. */
+  fields?: SchemaField[];
+  /** Keep only the first capture group (or whole match) of this regex. */
+  regex?: string;
+}
+
+export interface ExtractionSchema {
+  baseSelector: string;
+  fields: SchemaField[];
+}
+
+function fieldValue(el: any, f: SchemaField, base: string): any {
+  const type = f.type || "text";
+  if (type === "list") {
+    const nodes = f.selector ? Array.from(el.querySelectorAll(f.selector)) : [el];
+    return nodes.map((n: any) => (f.fields?.length ? objectFrom(n, f.fields, base) : applyRegex(spacedText(n), f.regex)));
+  }
+  const node = f.selector ? el.querySelector(f.selector) : el;
+  if (type === "exists") return !!node;
+  if (!node) return null;
+  switch (type) {
+    case "nested":
+      return objectFrom(node, f.fields || [], base);
+    case "html":
+      return node.innerHTML;
+    case "attribute": {
+      const attr = f.attribute || "href";
+      const v = node.getAttribute(attr);
+      if (v == null) return null;
+      return ["href", "src", "action", "data-src"].includes(attr) ? resolve(v, base) : applyRegex(v, f.regex);
+    }
+    case "number": {
+      const t = applyRegex(spacedText(node), f.regex) || "";
+      const m = String(t).replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+      return m ? parseFloat(m[0]) : null;
+    }
+    default:
+      return applyRegex(spacedText(node), f.regex);
+  }
+}
+
+function applyRegex(v: string, re?: string): string | null {
+  if (!re) return v;
+  const m = v.match(new RegExp(re));
+  return m ? (m[1] ?? m[0]) : null;
+}
+
+function objectFrom(el: any, fields: SchemaField[], base: string): Record<string, any> {
+  const o: Record<string, any> = {};
+  for (const f of fields) o[f.name] = fieldValue(el, f, base);
+  return o;
+}
+
+/** Extract one record per `baseSelector` match (Crawl4AI JsonCss-style schema). */
+export function extractBySchema(doc: any, base: string, schema: ExtractionSchema, max = 1000): Record<string, any>[] {
+  const items = Array.from(doc.querySelectorAll(schema.baseSelector)).slice(0, max);
+  return items.map((el: any) => objectFrom(el, schema.fields, base));
+}

@@ -55,6 +55,7 @@
     "linkedom": "^0.18.13",
     "playwright": "^1.52.0",
     "undici": "^7.30.0",
+    "unpdf": "^1.8.1",
     "zod": "^3.24.4"
   },
   "devDependencies": {

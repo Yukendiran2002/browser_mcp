@@ -2,7 +2,7 @@
 
 **Browser automation and web scraping for AI agents, built to keep token cost and latency low.**
 
-An [MCP](https://modelcontextprotocol.io/) server built on [Playwright](https://playwright.dev/). It gives agents a real browser (including your logged-in Chrome) and a scraping engine that only starts a browser when a page actually needs one. It also ships [DejavuScraper](https://github.com/Yukendiran2002/dejavu_scraper)'s learn-by-example extraction: learn a scraper from one example value per field, then run it on any number of similar pages without an LLM call per page.
+An [MCP](https://modelcontextprotocol.io/) server built on [Playwright](https://playwright.dev/). It gives agents a real browser (including your logged-in Chrome) and a scraping engine that only starts a browser when a page actually needs one. It also calls sites' own JSON APIs directly, replays recorded flows as macros, and ships [DejavuScraper](https://github.com/Yukendiran2002/dejavu_scraper)'s learn-by-example extraction: learn a scraper from one example value per field, then run it on any number of similar pages without an LLM call per page.
 
 ```
 You: "Get name + price for every laptop on shop.example, all pages."
@@ -14,32 +14,69 @@ agent → run_extractor   {name: "laptops", url, followPages: 20}               
 
 ---
 
+## Head-to-head benchmark
+
+`bench/compare.mjs` runs the same four tasks against this server, [Playwright MCP](https://github.com/microsoft/playwright-mcp) 0.0.82 and [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) 1.10.1 on a local fixture site, using the call sequence a competent agent would use with each server's own tools (Playwright's `browser_find`/`browser_fill_form`/`browser_evaluate`, DevTools' `fill_form`/`evaluate_script`/`wait_for`, …). Success is checked server-side, not from tool output.
+
+| Task | This server | Playwright MCP | Chrome DevTools MCP |
+|---|---|---|---|
+| **shop**: busy store page, dismiss cookie banner, add product 3 to cart, confirm | 3 calls · 1.3k result tokens | 5 calls · 6.1k | 5 calls · 10.4k |
+| **login**: fill 4 fields, submit, confirm welcome | 2 calls · 0.3k | 5 calls · 0.6k | 5 calls · 0.6k |
+| **extract**: name + price of 72 products on 3 pages | 2 calls · 1.0k | 7 calls · 7.4k | 7 calls · 6.2k |
+| **read**: answer a question from an article | 1 call · 0.1k | 2 calls · 0.8k | 2 calls · 0.6k |
+| **Total** (all 4/4 successful) | **8 calls · 2.7k · 3.1 s** | 19 calls · 14.8k · 7.6 s | 19 calls · 17.7k · 5.4 s |
+| Tool schema sent every turn | 27 tools · 4.6k tokens | 25 tools · 5.0k | 30 tools · 6.4k |
+| **Estimated input tokens** (schema + growing context, per turn, uncached) | **61k** | 184k (3.0×) | 212k (3.5×) |
+
+Snapshot of a real page ([pypi.org/project/httpx](https://pypi.org/project/httpx/), `bench/real.mjs`):
+
+| | chars | ≈ tokens |
+|---|---:|---:|
+| Playwright MCP `browser_snapshot` | 31,171 | 7,800 |
+| Chrome DevTools MCP `take_snapshot` | 28,419 | 7,100 |
+| **`snapshot`** (all 96 actionable elements, with refs) | 3,837 | **960** |
+| **`snapshot viewportOnly`** | 751 | **190** |
+| **`read_page`** (visible main content as markdown) | 4,358 | 1,090 |
+
+Caveats: the task scripts and the fixture site are ours; they use each competitor's most economical tools, but a real LLM agent may take different paths. Reproduce with `cd bench && npm install && node compare.mjs`.
+
+---
+
+## How it compares
+
+Features found by reviewing the leading browser/scraping MCP servers (September 2026) and what this server does about each:
+
+| Idea (where it comes from) | Here |
+|---|---|
+| Accessibility snapshot with refs (Playwright MCP, Chrome DevTools MCP, agent-browser) | Actionable-only snapshot with landmarks; merges headings into their links, drops duplicate thumbnail links, folds footer link farms; `find=` search and `root=` scoping |
+| See the effect of an action (Playwright returns code only; DevTools needs `includeSnapshot`) | Every action returns the snapshot **diff**, navigation, new tab, dialog, and live-region messages |
+| Big outputs to files (Playwright CLI, Firecrawl >20k handoff) | Any result over `--max-response` is saved to a file and only the head is returned |
+| Secrets (Playwright `--secrets`, agent-browser auth vault) | `{{secret.NAME}}` placeholders; values are masked in every response, including JS results |
+| `--if-changed` screenshots (agent-browser) | `take_screenshot ifChanged` |
+| Search + scrape in one call (Firecrawl) | `web_search scrape=N` (DuckDuckGo, SearXNG or Brave), HTTP-first `scrape`/`crawl`/`map_site`, PDFs |
+| LLM-free CSS schemas, best-first crawling, infinite scroll (Crawl4AI) | `extract_structured schema=`, `crawl query=` visits relevant links first, `scrape scroll=N` |
+| Call the site's internal APIs instead of rendering (Unbrowse) | `list_apis` / `call_api`: JSON XHR/fetch traffic is captured while browsing and replayed with the session's cookies and auth headers, with `select=` field paths |
+| Self-healing, cached actions (Stagehand/Browserbase, needs an LLM + API key) | Learned extractors self-heal by fingerprint; **macros** replay recorded flows with stable selectors and variables, with no LLM and no key |
+| Performance insights (Chrome DevTools MCP) | `page_metrics`: TTFB/FCP/LCP/CLS, long tasks, bytes by type, DOM size, errors |
+| Allowed/blocked origins, idle timeout (Playwright MCP) | `--allowed-domains`, `--blocked-domains` (enforced on every top-level navigation), `--idle-timeout` |
+
+Not covered: Lighthouse audits, heap snapshots and tracing (use Chrome DevTools MCP), cross-browser test assertions/codegen (Playwright MCP), hosted infrastructure and CAPTCHA solving (Browserbase, Firecrawl).
+
+---
+
 ## Why it's cheaper and faster
 
 | Technique | What it saves |
 |---|---|
-| **Ref snapshots** (`snapshot`) | One line per actionable element, e.g. `- button "Sign in" [e7]`, instead of HTML or a full accessibility tree. |
-| **Actions return diffs** | `click`/`type_text`/`batch` return only the snapshot lines that changed, plus navigation, new tabs and dialogs, so the agent rarely needs another snapshot. |
-| **`batch`** | Fill a form, submit it and wait for the result in one tool call instead of five. |
-| **HTTP-first scraping** | `scrape`/`crawl` fetch over plain HTTP (~10–50 ms locally) and switch to a background browser tab only for JS-rendered pages or bot walls. Hosts that keep needing a browser skip the HTTP probe. |
-| **Markdown + `query=`** | Main-content markdown without nav, footers or cookie banners. `query` keeps only the BM25-relevant sections. |
-| **Learned extractors** | `learn_extractor` once, then `run_extractor`/`crawl extractor=` with no LLM calls. Rules self-heal when a site's layout changes. |
-| **Small default toolset** | Tool schemas are sent on every turn. The default is 25 tools (~3.9k tokens); v2 always exposed 75 (~7.1k). Enable more with `--tools`. |
-| **Fast mode by default** | Real mouse/keyboard events without artificial delays. Use `--human` for Bezier mouse paths and human typing rhythm. |
-
-### Measured on a real page (pypi.org/project/httpx)
-
-| Representation | Size | ≈ Tokens |
-|---|---:|---:|
-| Raw HTML | 148,489 chars | ~37,100 |
-| `innerText` | 36,132 chars | ~9,000 |
-| Playwright `ariaSnapshot()` (full accessibility tree) | 18,216 chars | ~4,550 |
-| **`snapshot`** (all 96 actionable elements, with refs) | 4,383 chars | **~1,100** |
-| **`snapshot viewportOnly`** | 796 chars | **~200** |
-| **`read_page`** (visible main content as markdown) | 4,291 chars | ~1,070 |
-| **`scrape query="install proxy"`** | 1,307 chars | **~330** |
-
-Local fixture timings (from the test suite): `scrape` over HTTP took 10–45 ms per page, versus about 600 ms for a background browser tab. `run_extractor` over three paginated pages took 9 ms.
+| **Ref snapshots** | One line per actionable element (`- button "Sign in" [e7]`) instead of the full accessibility tree. |
+| **Actions return diffs** | The agent rarely needs a second snapshot after acting. |
+| **`batch` and macros** | A whole form in one call; a saved flow replays in one call with no reasoning. |
+| **HTTP-first scraping** | Plain HTTP (10–50 ms) and a background browser tab only for JS-rendered pages or bot walls; the decision is remembered per host. |
+| **Markdown + `query=`** | Main content only, then only the BM25-relevant sections. |
+| **Direct API calls** | Paginating a JSON endpoint costs a few hundred tokens instead of a page render + snapshot. |
+| **Learned extractors / CSS schemas** | Structured records from any number of pages with no per-page LLM work. |
+| **Small default toolset + size cap** | 27 tools (~4.6k schema tokens); results over 25k chars spill to files. |
+| **Fast mode by default** | No artificial delays; `--human` for human-like timing. |
 
 ---
 
@@ -102,27 +139,33 @@ node dist/index.js --channel chrome --user-data-dir "C:\Users\you\AppData\Local\
 | Tool | What it does |
 |---|---|
 | `navigate` | Open a URL; `returns: "snapshot" \| "markdown"` includes the page in the same call |
-| `snapshot` | Actionable elements with refs, plus headings, landmarks, live regions and iframes. `viewportOnly`, `mode: "full"`, `urls` |
+| `snapshot` | Actionable elements with refs, plus headings, landmarks, live regions and iframes. `find`, `root`, `viewportOnly`, `mode: "full"`, `urls` |
 | `click`, `type_text`, `select_option`, `hover`, `press_key`, `scroll` | Accept a **ref** (`e12`, `f2e3` for iframes), CSS, XPath or visible text/label. Return what changed |
 | `fill_form` | Text fields, selects and checkboxes in one call |
 | `batch` | Up to 50 steps (`navigate, click, type, fill, select, check, uncheck, hover, press, scroll, wait, upload, drag, eval, back, forward, reload`) in one call |
 | `wait_for` | Text, element (or `gone`), URL, network idle, or ms |
 | `read_page` | Current tab as clean markdown; `query`, `selector`, `links: inline\|refs\|none` |
-| `take_screenshot` | JPEG at CSS scale by default (smaller payloads); element or full page |
-| `tabs` | List, new, close, focus |
-| `go_back`, `evaluate_javascript`, `browser_connect`, `close_browser` | |
+| `take_screenshot` | JPEG at CSS scale; element or full page; `ifChanged` skips identical images |
+| `tabs`, `go_back`, `evaluate_javascript` | |
 
-### `scrape`: fetch, crawl and extract
+### `scrape`: fetch, search, crawl, extract
 
 | Tool | What it does |
 |---|---|
-| `scrape` | One URL or up to 100 (`urls`) concurrently, as markdown. `mode: auto\|http\|browser`, `query`, `structured`, `includeLinks`, `outputFile` (JSONL) |
-| `crawl` | Same-domain BFS, robots.txt-aware, concurrent; `include`/`exclude` regexes, `extractor` to emit records per page, `outputFile` |
-| `map_site` | URLs from robots.txt, sitemaps (including sitemap indexes) and homepage links; `search` ranks by keyword |
-| `extract_structured` | No-LLM extraction: metadata/OpenGraph, JSON-LD, microdata, tables, repeated items (products, results, cards), pagination, emails/phones, prices, feeds |
-| `learn_extractor` | Learn rules from 1–2 example values per field (`{"title": ["…"], "price": ["…"]}`, `/regex/` allowed) and preview the records |
-| `run_extractor` | Apply to the current tab, a URL or up to 500 URLs; `followPages` for pagination; records or grouped output; self-healing |
-| `manage_extractors` | list / show / delete / keep_rules / remove_rules |
+| `web_search` | Search (DuckDuckGo by default, `--search-url` SearXNG, or `BRAVE_API_KEY`); `scrape: N` also returns the top N pages as query-filtered markdown |
+| `scrape` | One URL or up to 100 (`urls`) concurrently, as markdown. HTML, PDFs, JSON. `mode: auto\|http\|browser`, `query`, `scroll`, `structured`, `includeLinks`, `outputFile` |
+| `crawl` | Same-domain, robots.txt-aware, concurrent; best-first when `query` is set; `include`/`exclude`, `extractor` or `schema` for records, `outputFile` |
+| `map_site` | URLs from robots.txt, sitemaps and homepage links; `search` ranks by keyword |
+| `extract_structured` | Metadata, JSON-LD, microdata, tables, repeated items, pagination, contacts, prices, feeds, or your own CSS `schema` |
+| `learn_extractor`, `run_extractor`, `manage_extractors` | Learn rules from 1–2 example values per field and run them on any number of pages (pagination, self-healing, DejavuScraper-compatible files) |
+| `list_apis` | JSON endpoints the site called while you browsed, with response shapes (`{items:[24]{id:num,name:str}}`) |
+| `call_api` | Call an endpoint with the browser's cookies and captured auth headers; `query` overrides, `select: "items[*].{name,price}"` |
+
+### `macros`
+
+| Tool | What it does |
+|---|---|
+| `macro` | Actions are recorded automatically (refs become stable selectors such as `#email` or `button:text-is("Sign in")`). `save` with `params: {"email": "me@x.com"}` turns example values into variables; `run` with `vars` replays the flow |
 
 ### Optional groups (`--tools core,scrape,storage,…` or `--tools all`)
 
@@ -138,9 +181,11 @@ node dist/index.js --channel chrome --user-data-dir "C:\Users\you\AppData\Local\
 | `frames` | `list_frames`, `execute_in_frame`, `click_in_frame` |
 | `pdf` | `save_as_pdf` |
 | `vision` | `mark_page`, `click_element`, `type_into_element`, `mark_page_and_screenshot`, `unmark_page` |
+| `session` | `browser_connect`, `close_browser` (connection is normally set by CLI flags; tools auto-connect) |
+| `devtools` | `page_metrics`, `get_network_log`, `get_console_logs` |
 | `misc` | `handle_dialog`, `smart_action`, `get_browser_info` |
 
-Individual tool names work too: `--tools core,scrape,get_cookies`.
+Default: `core,scrape,macros` (27 tools). Individual tool names work too: `--tools core,scrape,get_cookies`.
 
 ---
 
@@ -185,6 +230,26 @@ s.get_result_similar(url="https://jobs.example/search?q=python", group_by_alias=
 
 `run_extractor` also accepts a path to a rules file saved by Python (`name: "/path/rules.json"`).
 
+**Skip the page, call the API**
+
+```
+navigate {url: "https://shop.example/search?q=tv"}      ← the page loads its data from JSON
+list_apis
+  → GET shop.example/api/search?q=&page= ×1 → 200 48KB · auth header
+    shape: {results:[24]{id:num,title:str,price:{amount:num}},total:num}
+call_api {url: "https://shop.example/api/search", query: {q: "tv", page: 2}, select: "results[*].{title,price}"}
+```
+
+**Record once, replay forever**
+
+```
+batch {...log in and search as usual...}
+macro {action: "save", name: "search", params: {"query": "laptops"}}
+macro {action: "run",  name: "search", vars: {"query": "phones"}}      ← later, one call, no reasoning
+```
+
+Secrets stay out of the model's context: start with `--secrets .env` (or `BROWSER_SECRET_*` variables) and type `{{secret.GITHUB_PASSWORD}}`. The real value never appears in any result, and saved macros keep the placeholder.
+
 **How the extractor works.** For each example value it finds the element holding it (text, direct text, or an attribute such as `href`/`src`) and records the tag/class path from the document root. Applying a rule walks that path while allowing any sibling index, which yields every similar item. Results are zipped into records by finding each item's container. Each rule also stores a fingerprint of what it matched (text shapes like `$9.9`, lengths, tags and classes). If a redesign breaks the path, similar elements are scored against that fingerprint and the result is flagged as healed. `<tbody>` is treated as transparent, so rules learned on a live browser DOM also apply to raw HTML.
 
 ---
@@ -192,12 +257,17 @@ s.get_result_similar(url="https://jobs.example/search?q=python", group_by_alias=
 ## CLI options
 
 ```
-TOOLS        --tools <groups|names|all>   default: core,scrape
+TOOLS        --tools <groups|names|all>   default: core,scrape,macros
              --human                      human-like timing and mouse paths (slower, stealthier)
 SCRAPING     --data-dir <path>            learned extractors (default ~/.browser-mcp)
              --cache-ttl <seconds>        page cache (default 300)
              --pool-size <n>              background tabs for scraping (default 4)
              --no-block-resources         load images/fonts/media when scraping in the browser
+SAFETY/COST  --secrets <file.env>          {{secret.NAME}} placeholders; values masked in all output
+             --max-response <chars>       larger results go to a file (default 25000, 0 = off); --output-dir <path>
+             --allowed-domains <list>     e.g. "example.com,*.example.org"; --blocked-domains <list>
+             --idle-timeout <seconds>     close a launched browser when idle (default 1800, 0 = never)
+SEARCH       --search-url <url>           SearXNG instance; or set BRAVE_API_KEY; default DuckDuckGo HTML
 TRANSPORT    --http <port>                Streamable HTTP at http://127.0.0.1:<port>/mcp (default: stdio)
              --host <addr>                bind address (default 127.0.0.1)
              --token <secret>             require "Authorization: Bearer <secret>"
@@ -209,7 +279,7 @@ CONTEXT      --user-agent  --locale  --timezone  --color-scheme  --geolocation l
 SESSION      --storage-state <file>   VIDEO  --record-video  --video-dir <path>
 ```
 
-Environment variables: `BROWSER_CDP_URL`, `BROWSER_USER_DATA_DIR`, `BROWSER_EXECUTABLE_PATH`, `BROWSER_ENGINE`, `BROWSER_PROXY`, `BROWSER_HEADLESS=1`, `BROWSER_HUMAN=1`, `BROWSER_MCP_TOOLS`, `BROWSER_MCP_DATA_DIR`, `BROWSER_MCP_TOKEN`.
+Environment variables: `BROWSER_CDP_URL`, `BROWSER_USER_DATA_DIR`, `BROWSER_EXECUTABLE_PATH`, `BROWSER_ENGINE`, `BROWSER_PROXY`, `BROWSER_HEADLESS=1`, `BROWSER_HUMAN=1`, `BROWSER_MCP_TOOLS`, `BROWSER_MCP_DATA_DIR`, `BROWSER_MCP_TOKEN`, `BROWSER_MCP_SECRETS`, `BROWSER_SECRET_<NAME>`, `BROWSER_MCP_SEARCH_URL`, `BRAVE_API_KEY`, `BROWSER_MCP_ALLOWED_DOMAINS`, `BROWSER_MCP_BLOCKED_DOMAINS`.
 
 The HTTP fast path uses `--proxy-server` when it is an http(s) proxy, or `HTTPS_PROXY`/`HTTP_PROXY`. With a SOCKS proxy every fetch goes through the browser.
 
@@ -250,7 +320,14 @@ src/index.ts            CLI, stdio/HTTP transports, server factory
 src/toolsets.ts         tool groups and --tools filtering
 src/tools/core.ts       snapshot/interaction tools, batch
 src/tools/scrape.ts     scrape, crawl, map_site, extract_structured, learn/run/manage_extractors
-src/tools/actions.ts    shared action implementations (used by tools and batch)
+src/tools/actions.ts    shared action implementations (used by tools, batch and macros)
+src/tools/apis.ts       list_apis / call_api;  src/apis.ts captures JSON traffic
+src/tools/devtools.ts   page_metrics
+src/macros.ts           stable selectors, recorder, macro storage
+src/search.ts           web_search providers
+src/governor.ts         secret masking + oversized-result spill to files
+src/policy.ts           allowed/blocked domains
+bench/                  head-to-head benchmark vs Playwright MCP and Chrome DevTools MCP
 src/snapshot.ts         in-page ref snapshot, diffs, ref resolution (incl. iframes, shadow DOM)
 src/scraper.ts          HTTP fast path, browser pool, cache, robots.txt, crawl, sitemap map
 src/content/markdown.ts HTML → markdown (runs in-page or on linkedom)

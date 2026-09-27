@@ -6,7 +6,8 @@ import { BrowserManager } from "../browser-manager.js";
 import { Scraper, formatScrape, type ScrapeOptions, type ScrapeResult } from "../scraper.js";
 import { ExtractorStore } from "../extractor-store.js";
 import { parseDocument } from "../content/dom.js";
-import { extractStructured, ALL_KINDS, type StructuredKind } from "../content/structured.js";
+import { extractStructured, extractBySchema, ALL_KINDS, type StructuredKind } from "../content/structured.js";
+import { webSearch, type SearchConfig } from "../search.js";
 import { learn, applyRules, records, grouped, type ExtractorModel, type Rule } from "../content/dejavu.js";
 import { ok, fail, truncate, normalizeInputUrl } from "./helpers.js";
 
@@ -21,7 +22,11 @@ function writeOut(path: string, data: string): string {
 }
 
 function json(v: any, max: number): string {
-  const s = JSON.stringify(v, null, 1);
+  // Arrays of records: one compact object per line (≈40% fewer tokens than pretty-printing).
+  const s =
+    Array.isArray(v) && v.every((x) => x && typeof x === "object" && !Array.isArray(x))
+      ? "[\n" + v.map((x) => JSON.stringify(x)).join(",\n") + "\n]"
+      : JSON.stringify(v, null, 1);
   return s.length > max ? s.slice(0, max) + `\n…(truncated; ${s.length} chars — use outputFile to save everything)` : s;
 }
 
@@ -46,7 +51,42 @@ async function currentDoc(browser: BrowserManager, pageId?: number): Promise<{ d
   return { doc: parseDocument(await page.content()), url: page.url() };
 }
 
-export function registerScrapeTools(server: McpServer, browser: BrowserManager, scraper: Scraper, store: ExtractorStore): void {
+const schemaParam = z
+  .object({ baseSelector: z.string(), fields: z.array(z.any()) })
+  .optional()
+  .describe("CSS schema → records. field: {name, selector?, type?: text|attribute|html|number|exists|list|nested, attribute?, regex?, fields?}");
+
+export function registerScrapeTools(
+  server: McpServer,
+  browser: BrowserManager,
+  scraper: Scraper,
+  store: ExtractorStore,
+  searchCfg: SearchConfig = {}
+): void {
+  server.tool(
+    "web_search",
+    "Search the web. With scrape=N also fetches the top N results as query-filtered markdown in the same call.",
+    {
+      query: z.string(),
+      limit: z.number().optional().describe("Default 8"),
+      scrape: z.number().optional().describe("Fetch top N results"),
+      maxChars: z.number().optional().describe("Per scraped page, default 2000"),
+    },
+    async ({ query, limit, scrape, maxChars }) => {
+      try {
+        const { results, provider } = await webSearch(scraper, query, limit ?? 8, searchCfg);
+        if (!results.length) return ok(`No results (${provider})`);
+        const list = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${truncate(r.snippet, 200)}` : ""}`).join("\n");
+        if (!scrape) return ok(`${results.length} results (${provider}):\n${list}`);
+        const top = results.slice(0, Math.min(scrape, 10));
+        const pages = await Promise.all(top.map((r) => scraper.scrape(r.url, { query, maxChars: maxChars ?? 2_000 })));
+        return ok(`${results.length} results (${provider}):\n${list}\n\n---\n\n${pages.map(formatScrape).join("\n\n---\n\n")}`);
+      } catch (e: any) {
+        return fail(`web_search failed: ${e.message}`);
+      }
+    }
+  );
+
   server.tool(
     "scrape",
     "Fetch URL(s) as clean markdown (fast HTTP; background browser only for JS/protected pages). Doesn't touch the active tab.",
@@ -62,7 +102,7 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
       structured: z.union([z.boolean(), z.array(kindEnum)]).optional().describe("Add extract_structured data"),
       includeLinks: z.boolean().optional(),
       waitFor: z.string().optional().describe("CSS to await (browser)"),
-      concurrency: z.number().optional(),
+      scroll: z.number().optional().describe("Infinite scroll: load up to N more screens (browser)"),
       outputFile: z.string().optional().describe("Save JSONL, return summary"),
     },
     async (a) => {
@@ -78,10 +118,11 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
         structured: a.structured,
         includeLinks: a.includeLinks,
         waitFor: a.waitFor,
+        scroll: a.scroll,
       };
       const results: ScrapeResult[] = new Array(list.length);
       let next = 0;
-      const conc = Math.max(1, Math.min(a.concurrency ?? 6, 16));
+      const conc = 6;
       await Promise.all(
         Array.from({ length: Math.min(conc, list.length) }, async () => {
           while (next < list.length) {
@@ -102,20 +143,17 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
 
   server.tool(
     "crawl",
-    "Crawl a site (BFS, same domain, robots.txt) returning each page's markdown, or records if extractor is set.",
+    "Crawl a site (same domain, robots.txt; best-first when query is set) returning page markdown, or records with extractor/schema.",
     {
       url: z.string(),
       maxPages: z.number().optional().describe("Default 20"),
       maxDepth: z.number().optional().describe("Default 2"),
       include: z.array(z.string()).optional().describe("URL regexes"),
       exclude: z.array(z.string()).optional(),
-      sameDomain: z.boolean().optional(),
-      mode: modeParam,
-      query: z.string().optional(),
+      query: z.string().optional().describe("Relevant sections only; visits matching links first"),
       maxCharsPerPage: z.number().optional(),
       extractor: z.string().optional().describe("Learned extractor name"),
-      concurrency: z.number().optional(),
-      respectRobots: z.boolean().optional(),
+      schema: schemaParam,
       outputFile: z.string().optional().describe("Save JSONL"),
     },
     async (a) => {
@@ -133,14 +171,15 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
             maxDepth: a.maxDepth,
             include: a.include,
             exclude: a.exclude,
-            sameDomain: a.sameDomain,
-            concurrency: a.concurrency,
-            respectRobots: a.respectRobots,
-            scrape: { mode: a.mode, query: a.query, maxChars: a.maxCharsPerPage ?? 1_500 },
+            scrape: { query: a.query, maxChars: a.maxCharsPerPage ?? 1_500 },
+            prioritize: a.query,
           },
           (r, doc, depth) => {
             let recs: any[] | undefined;
-            if (model && doc) {
+            if (a.schema && doc) {
+              recs = extractBySchema(doc, r.finalUrl, a.schema as any);
+              totalRecords += recs.length;
+            } else if (model && doc) {
               recs = records(applyRules(doc, r.finalUrl, model.stack_list));
               totalRecords += recs.length;
             }
@@ -193,12 +232,13 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
     {
       url: z.string().optional(),
       kinds: z.array(kindEnum).optional(),
+      schema: schemaParam,
       maxItems: z.number().optional(),
       mode: modeParam,
       pageId: z.number().optional(),
       outputFile: z.string().optional(),
     },
-    async ({ url, kinds, maxItems, mode, pageId, outputFile }) => {
+    async ({ url, kinds, schema, maxItems, mode, pageId, outputFile }) => {
       try {
         let doc: any;
         let base: string;
@@ -208,6 +248,11 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
           base = f.finalUrl;
         } else {
           ({ doc, url: base } = await currentDoc(browser, pageId));
+        }
+        if (schema) {
+          const recs = extractBySchema(doc, base, schema as any);
+          if (outputFile) return ok(`Saved ${recs.length} record(s) to ${writeOut(outputFile, JSON.stringify(recs, null, 1))}`);
+          return ok(`${recs.length} record(s)\n${json(recs.slice(0, maxItems ?? 100), 20_000)}`);
         }
         const data = extractStructured(doc, base, kinds ?? ALL_KINDS, maxItems ?? 30);
         if (outputFile) return ok(`Saved to ${writeOut(outputFile, JSON.stringify(data, null, 1))} (keys: ${Object.keys(data).join(", ")})`);
@@ -303,7 +348,7 @@ export function registerScrapeTools(server: McpServer, browser: BrowserManager, 
           if (healed.length) notes.push(`${url}: rules for [${healed.join(", ")}] no longer matched — used similarity matching (consider re-learning)`);
           if ((a.format ?? "records") === "records") {
             const recs = records(res);
-            if (a.urls?.length || a.followPages) for (const r of recs) r._url = url;
+            if (a.outputFile && (a.urls?.length || a.followPages)) for (const r of recs) r._url = url;
             all.push(...recs);
           } else {
             for (const [k, v] of Object.entries(grouped(res))) (groupedAll[k] ||= []).push(...v);

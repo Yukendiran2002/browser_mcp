@@ -27,6 +27,11 @@ import { Scraper } from "./scraper.js";
 import { ExtractorStore } from "./extractor-store.js";
 import { setHumanMode } from "./human.js";
 import { filteredServer, resolveToolFilter, TOOL_GROUPS } from "./toolsets.js";
+import { registerApiTools } from "./tools/apis.js";
+import { registerDevtoolsTools } from "./tools/devtools.js";
+import { MacroStore } from "./macros.js";
+import { govern, configureGovernor, loadSecrets, secretNames } from "./governor.js";
+import { configurePolicy } from "./policy.js";
 
 export const VERSION = "3.0.0";
 
@@ -39,12 +44,20 @@ interface ServerConfig {
   httpPort?: number;
   httpHost?: string;
   token?: string;
+  secrets?: string;
+  maxResponse?: number;
+  outputDir?: string;
+  allowedDomains?: string;
+  blockedDomains?: string;
+  idleTimeoutSec?: number;
+  searchUrl?: string;
 }
 
 const INSTRUCTIONS = `Browser + scraping tools. To keep cost low:
-- Reading/scraping: use scrape (HTTP fast path, many URLs per call) or read_page for the current tab; pass query= to get only relevant sections. Avoid screenshots unless you need pixels.
-- Interacting: call snapshot once, then use its refs (e.g. e12) as selector. Actions return only what changed. Chain steps with batch.
-- Repeated extraction: learn_extractor once from 1-2 example values, then run_extractor/crawl with extractor= on any number of similar pages — no LLM tokens per page.`;
+- Reading/scraping: web_search (scrape=N reads top results), scrape (HTTP fast path, many URLs per call) or read_page for the current tab; pass query= to get only relevant sections. Avoid screenshots unless you need pixels.
+- Interacting: call snapshot once (find= to search it), then use its refs (e.g. e12) as selector. Actions return only what changed. Chain steps with batch.
+- Data behind a page is often a JSON API: after browsing, list_apis then call_api (next pages, other queries) instead of re-rendering.
+- Repeated work: learn_extractor once from 1-2 example values, then run_extractor/crawl extractor= on any number of pages; save interaction flows with macro save and replay them with macro run — no LLM tokens per page.`;
 
 // ─── Parse CLI args ──────────────────────────────────────────
 
@@ -153,6 +166,27 @@ function parseArgs(): { options: BrowserConnectionOptions; config: ServerConfig 
       case "--token":
         config.token = args[++i];
         break;
+      case "--secrets":
+        config.secrets = args[++i];
+        break;
+      case "--max-response":
+        config.maxResponse = parseInt(args[++i], 10);
+        break;
+      case "--output-dir":
+        config.outputDir = args[++i];
+        break;
+      case "--allowed-domains":
+        config.allowedDomains = args[++i];
+        break;
+      case "--blocked-domains":
+        config.blockedDomains = args[++i];
+        break;
+      case "--idle-timeout":
+        config.idleTimeoutSec = parseInt(args[++i], 10);
+        break;
+      case "--search-url":
+        config.searchUrl = args[++i];
+        break;
       case "--help":
         console.error(`
 Browser MCP Server v${VERSION} — fast, token-efficient browsing and scraping for AI agents
@@ -172,6 +206,15 @@ TRANSPORT:
   --http <port>               Serve MCP over Streamable HTTP at http://host:port/mcp (default: stdio)
   --host <addr>               Bind address for --http (default: 127.0.0.1)
   --token <secret>            Require "Authorization: Bearer <secret>" for --http
+
+SAFETY & COST:
+  --secrets <file.env>        Secrets typed as {{secret.NAME}}; values never appear in responses
+  --max-response <chars>      Larger results are saved to a file, only the head is returned (default 25000, 0 = off)
+  --output-dir <path>         Where oversized results are written (default: OS temp dir)
+  --allowed-domains <list>    Only these domains (e.g. "example.com,*.example.org")
+  --blocked-domains <list>    Never these domains
+  --idle-timeout <seconds>    Close a launched browser after inactivity (default 1800, 0 = never)
+  --search-url <url>          SearXNG instance for web_search (default: DuckDuckGo; BRAVE_API_KEY uses Brave)
 
 CONNECTION:
   --cdp <url>                 Connect via Chrome DevTools Protocol (e.g. http://localhost:9222)
@@ -262,6 +305,10 @@ Examples:
   config.tools ??= process.env.BROWSER_MCP_TOOLS;
   config.dataDir ??= process.env.BROWSER_MCP_DATA_DIR;
   config.token ??= process.env.BROWSER_MCP_TOKEN;
+  config.secrets ??= process.env.BROWSER_MCP_SECRETS;
+  config.searchUrl ??= process.env.BROWSER_MCP_SEARCH_URL;
+  config.allowedDomains ??= process.env.BROWSER_MCP_ALLOWED_DOMAINS;
+  config.blockedDomains ??= process.env.BROWSER_MCP_BLOCKED_DOMAINS;
 
   return { options, config };
 }
@@ -294,14 +341,23 @@ async function main() {
     blockResources: config.blockResources,
   });
   const store = new ExtractorStore(config.dataDir);
+  const macros = new MacroStore(config.dataDir);
   const allow = resolveToolFilter(config.tools);
+  const nSecrets = loadSecrets(config.secrets);
+  configureGovernor({ maxChars: config.maxResponse, outputDir: config.outputDir });
+  configurePolicy(config.allowedDomains, config.blockedDomains);
+  browserManager.setIdleTimeout((config.idleTimeoutSec ?? 1800) * 1000);
+  const searchCfg = { searxUrl: config.searchUrl, braveKey: process.env.BRAVE_API_KEY };
+  const instructions = INSTRUCTIONS + (nSecrets ? `\n- Secrets available (type them as {{secret.NAME}}): ${secretNames().join(", ")}` : "");
 
   /** One MCP server per client session; all share the browser, scraper and store. */
   const buildServer = () => {
-    const server = new McpServer({ name: "browser-mcp-server", version: VERSION }, { instructions: INSTRUCTIONS });
-    const filtered = filteredServer(server, allow);
-    registerCoreTools(filtered, browserManager);
-    registerScrapeTools(filtered, browserManager, scraper, store);
+    const server = new McpServer({ name: "browser-mcp-server", version: VERSION }, { instructions });
+    const filtered = filteredServer(server, allow, govern);
+    registerCoreTools(filtered, browserManager, macros);
+    registerScrapeTools(filtered, browserManager, scraper, store, searchCfg);
+    registerApiTools(filtered, browserManager);
+    registerDevtoolsTools(filtered, browserManager);
     registerTools(filtered, browserManager);
     registerResources(server, browserManager);
     return server;
