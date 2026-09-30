@@ -14,6 +14,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       try {
         const { id, page } = await browser.getOrCreatePage();
         const title = await page.title();
@@ -49,6 +52,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       const pages = await browser.listPagesWithTitles();
       return {
         contents: [
@@ -71,6 +77,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       try {
         const ctx = browser.getContext();
         const cookies = await ctx.cookies();
@@ -106,6 +115,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       try {
         const { id } = await browser.getOrCreatePage();
         const logs = browser.getConsoleLogs(id);
@@ -141,6 +153,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       try {
         const { id } = await browser.getOrCreatePage();
         const logs = browser.getNetworkLogs(id);
@@ -176,6 +191,9 @@ export function registerResources(server: McpServer, browser: BrowserManager): v
       mimeType: "application/json",
     },
     async (uri) => {
+      if (!browser.isConnected()) {
+        return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify({ error: "Browser not connected yet" }) }] };
+      }
       try {
         const info = browser.getBrowserInfo();
         return {

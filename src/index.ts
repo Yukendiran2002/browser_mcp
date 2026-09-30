@@ -12,17 +12,59 @@
  *   node dist/index.js --user-data-dir "C:/Users/you/AppData/Local/Google/Chrome/User Data"
  */
 
+import { createServer as createHttpServer, type IncomingMessage } from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { BrowserManager, BrowserConnectionOptions } from "./browser-manager.js";
 import { registerTools } from "./tools.js";
+import { registerCoreTools } from "./tools/core.js";
+import { registerScrapeTools } from "./tools/scrape.js";
 import { registerResources } from "./resources.js";
+import { Scraper } from "./scraper.js";
+import { ExtractorStore } from "./extractor-store.js";
+import { setHumanMode } from "./human.js";
+import { filteredServer, resolveToolFilter, TOOL_GROUPS } from "./toolsets.js";
+import { registerApiTools } from "./tools/apis.js";
+import { registerDevtoolsTools } from "./tools/devtools.js";
+import { MacroStore } from "./macros.js";
+import { govern, configureGovernor, loadSecrets, secretNames } from "./governor.js";
+import { configurePolicy } from "./policy.js";
+
+export const VERSION = "3.0.0";
+
+interface ServerConfig {
+  tools?: string;
+  dataDir?: string;
+  cacheTtlMs?: number;
+  poolSize?: number;
+  blockResources?: boolean;
+  httpPort?: number;
+  httpHost?: string;
+  token?: string;
+  secrets?: string;
+  maxResponse?: number;
+  outputDir?: string;
+  allowedDomains?: string;
+  blockedDomains?: string;
+  idleTimeoutSec?: number;
+  searchUrl?: string;
+}
+
+const INSTRUCTIONS = `Browser + scraping tools. To keep cost low:
+- Reading/scraping: web_search (scrape=N reads top results), scrape (HTTP fast path, many URLs per call) or read_page for the current tab; pass query= to get only relevant sections. Avoid screenshots unless you need pixels.
+- Interacting: call snapshot once (find= to search it), then use its refs (e.g. e12) as selector. Actions return only what changed. Chain steps with batch.
+- Data behind a page is often a JSON API: after browsing, list_apis then call_api (next pages, other queries) instead of re-rendering.
+- Repeated work: learn_extractor once from 1-2 example values, then run_extractor/crawl extractor= on any number of pages; save interaction flows with macro save and replay them with macro run — no LLM tokens per page.`;
 
 // ─── Parse CLI args ──────────────────────────────────────────
 
-function parseArgs(): BrowserConnectionOptions {
+function parseArgs(): { options: BrowserConnectionOptions; config: ServerConfig } {
   const args = process.argv.slice(2);
   const options: BrowserConnectionOptions = {};
+  const config: ServerConfig = {};
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -97,9 +139,82 @@ function parseArgs(): BrowserConnectionOptions {
       case "--block-service-workers":
         options.blockServiceWorkers = true;
         break;
+      case "--human":
+        options.human = true;
+        break;
+      case "--tools":
+        config.tools = args[++i];
+        break;
+      case "--data-dir":
+        config.dataDir = args[++i];
+        break;
+      case "--cache-ttl":
+        config.cacheTtlMs = parseInt(args[++i], 10) * 1000;
+        break;
+      case "--pool-size":
+        config.poolSize = parseInt(args[++i], 10);
+        break;
+      case "--no-block-resources":
+        config.blockResources = false;
+        break;
+      case "--http":
+        config.httpPort = parseInt(args[++i], 10);
+        break;
+      case "--host":
+        config.httpHost = args[++i];
+        break;
+      case "--token":
+        config.token = args[++i];
+        break;
+      case "--secrets":
+        config.secrets = args[++i];
+        break;
+      case "--max-response":
+        config.maxResponse = parseInt(args[++i], 10);
+        break;
+      case "--output-dir":
+        config.outputDir = args[++i];
+        break;
+      case "--allowed-domains":
+        config.allowedDomains = args[++i];
+        break;
+      case "--blocked-domains":
+        config.blockedDomains = args[++i];
+        break;
+      case "--idle-timeout":
+        config.idleTimeoutSec = parseInt(args[++i], 10);
+        break;
+      case "--search-url":
+        config.searchUrl = args[++i];
+        break;
       case "--help":
         console.error(`
-Browser MCP Server v2.0 — let AI agents drive a real browser with human-like behavior
+Browser MCP Server v${VERSION} — fast, token-efficient browsing and scraping for AI agents
+
+TOOLS:
+  --tools <list>              Tool groups or names (default: core,scrape). "all" enables everything.
+                              Groups: ${Object.keys(TOOL_GROUPS).join(", ")}
+  --human                     Human-like mouse/typing timing (slower, stealthier; default: fast)
+
+SCRAPING:
+  --data-dir <path>           Where learned extractors are stored (default: ~/.browser-mcp)
+  --cache-ttl <seconds>       Page cache lifetime (default: 300)
+  --pool-size <n>             Background browser tabs for scraping (default: 4)
+  --no-block-resources        Load images/fonts/media when scraping in the browser
+
+TRANSPORT:
+  --http <port>               Serve MCP over Streamable HTTP at http://host:port/mcp (default: stdio)
+  --host <addr>               Bind address for --http (default: 127.0.0.1)
+  --token <secret>            Require "Authorization: Bearer <secret>" for --http
+
+SAFETY & COST:
+  --secrets <file.env>        Secrets typed as {{secret.NAME}}; values never appear in responses
+  --max-response <chars>      Larger results are saved to a file, only the head is returned (default 25000, 0 = off)
+  --output-dir <path>         Where oversized results are written (default: OS temp dir)
+  --allowed-domains <list>    Only these domains (e.g. "example.com,*.example.org")
+  --blocked-domains <list>    Never these domains
+  --idle-timeout <seconds>    Close a launched browser after inactivity (default 1800, 0 = never)
+  --search-url <url>          SearXNG instance for web_search (default: DuckDuckGo; BRAVE_API_KEY uses Brave)
 
 CONNECTION:
   --cdp <url>                 Connect via Chrome DevTools Protocol (e.g. http://localhost:9222)
@@ -143,6 +258,10 @@ ENVIRONMENT VARIABLES:
   BROWSER_EXECUTABLE_PATH     Same as --executable-path
   BROWSER_ENGINE              Same as --browser
   BROWSER_PROXY               Same as --proxy-server
+  BROWSER_MCP_TOOLS           Same as --tools
+  BROWSER_MCP_DATA_DIR        Same as --data-dir
+  BROWSER_MCP_TOKEN           Same as --token
+  BROWSER_HUMAN=1             Same as --human
 
 Examples:
   # Auto-detect running Chrome on port 9222, or launch temp browser
@@ -181,43 +300,139 @@ Examples:
   if (!options.proxyServer && process.env.BROWSER_PROXY) {
     options.proxyServer = process.env.BROWSER_PROXY;
   }
+  if (!options.headless && process.env.BROWSER_HEADLESS === "1") options.headless = true;
+  if (!options.human && process.env.BROWSER_HUMAN === "1") options.human = true;
+  config.tools ??= process.env.BROWSER_MCP_TOOLS;
+  config.dataDir ??= process.env.BROWSER_MCP_DATA_DIR;
+  config.token ??= process.env.BROWSER_MCP_TOKEN;
+  config.secrets ??= process.env.BROWSER_MCP_SECRETS;
+  config.searchUrl ??= process.env.BROWSER_MCP_SEARCH_URL;
+  config.allowedDomains ??= process.env.BROWSER_MCP_ALLOWED_DOMAINS;
+  config.blockedDomains ??= process.env.BROWSER_MCP_BLOCKED_DOMAINS;
 
-  return options;
+  return { options, config };
 }
 
 // ─── Main ────────────────────────────────────────────────────
 
+function readBody(req: IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      try {
+        resolve(raw ? JSON.parse(raw) : undefined);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 async function main() {
-  const options = parseArgs();
+  const { options, config } = parseArgs();
   const browserManager = new BrowserManager(options);
-
-  // Create MCP server
-  const server = new McpServer({
-    name: "browser-mcp-server",
-    version: "2.0.0",
+  if (options.human) setHumanMode(true);
+  const scraper = new Scraper(browserManager, {
+    cacheTtlMs: config.cacheTtlMs,
+    poolSize: config.poolSize,
+    blockResources: config.blockResources,
   });
+  const store = new ExtractorStore(config.dataDir);
+  const macros = new MacroStore(config.dataDir);
+  const allow = resolveToolFilter(config.tools);
+  const nSecrets = loadSecrets(config.secrets);
+  configureGovernor({ maxChars: config.maxResponse, outputDir: config.outputDir });
+  configurePolicy(config.allowedDomains, config.blockedDomains);
+  browserManager.setIdleTimeout((config.idleTimeoutSec ?? 1800) * 1000);
+  const searchCfg = { searxUrl: config.searchUrl, braveKey: process.env.BRAVE_API_KEY };
+  const instructions = INSTRUCTIONS + (nSecrets ? `\n- Secrets available (type them as {{secret.NAME}}): ${secretNames().join(", ")}` : "");
 
-  // Register all tools & resources
-  registerTools(server, browserManager);
-  registerResources(server, browserManager);
+  /** One MCP server per client session; all share the browser, scraper and store. */
+  const buildServer = () => {
+    const server = new McpServer({ name: "browser-mcp-server", version: VERSION }, { instructions });
+    const filtered = filteredServer(server, allow, govern);
+    registerCoreTools(filtered, browserManager, macros);
+    registerScrapeTools(filtered, browserManager, scraper, store, searchCfg);
+    registerApiTools(filtered, browserManager);
+    registerDevtoolsTools(filtered, browserManager);
+    registerTools(filtered, browserManager);
+    registerResources(server, browserManager);
+    return server;
+  };
 
-  // Graceful shutdown
-  process.on("SIGINT", async () => {
+  const shutdown = async () => {
     console.error("[browser-mcp] Shutting down…");
+    await scraper.close();
     await browserManager.close();
     process.exit(0);
-  });
-  process.on("SIGTERM", async () => {
-    await browserManager.close();
-    process.exit(0);
-  });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
-  // Start stdio transport
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  if (config.httpPort) {
+    const host = config.httpHost || "127.0.0.1";
+    const port = config.httpPort;
+    const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
+    if (!loopback && !config.token) {
+      console.error("[browser-mcp] WARNING: listening on a non-loopback address without --token; anyone who can reach it controls the browser.");
+    }
+    const sessions = new Map<string, StreamableHTTPServerTransport>();
+    const tokenBuf = config.token ? Buffer.from(`Bearer ${config.token}`) : null;
+    const http = createHttpServer(async (req, res) => {
+      try {
+        const path = (req.url || "/").split("?")[0];
+        if (path === "/health") {
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, version: VERSION, sessions: sessions.size }));
+          return;
+        }
+        if (path !== "/mcp") {
+          res.writeHead(404).end();
+          return;
+        }
+        if (tokenBuf) {
+          const auth = Buffer.from(String(req.headers.authorization || ""));
+          if (auth.length !== tokenBuf.length || !timingSafeEqual(auth, tokenBuf)) {
+            res.writeHead(401, { "www-authenticate": "Bearer" }).end();
+            return;
+          }
+        }
+        const body = req.method === "POST" ? await readBody(req) : undefined;
+        const sid = req.headers["mcp-session-id"] as string | undefined;
+        let transport = sid ? sessions.get(sid) : undefined;
+        if (!transport) {
+          if (req.method !== "POST" || sid || !isInitializeRequest(body)) {
+            res.writeHead(400, { "content-type": "application/json" }).end(
+              JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Bad request: no valid session" }, id: null })
+            );
+            return;
+          }
+          const t: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (id) => {
+              sessions.set(id, t);
+            },
+            ...(loopback ? { enableDnsRebindingProtection: true, allowedHosts: [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`] } : {}),
+          });
+          t.onclose = () => {
+            if (t.sessionId) sessions.delete(t.sessionId);
+          };
+          await buildServer().connect(t);
+          transport = t;
+        }
+        await transport.handleRequest(req, res, body);
+      } catch (err: any) {
+        if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: err.message }));
+      }
+    });
+    http.listen(port, host, () => console.error(`[browser-mcp] v${VERSION} listening on http://${host}:${port}/mcp`));
+    return;
+  }
 
-  console.error("[browser-mcp] Server started — listening on stdio");
-  console.error(`[browser-mcp] Config: ${JSON.stringify(options)}`);
+  await buildServer().connect(new StdioServerTransport());
+  console.error(`[browser-mcp] v${VERSION} started on stdio (tools: ${config.tools || "core,scrape"})`);
 }
 
 main().catch((err) => {

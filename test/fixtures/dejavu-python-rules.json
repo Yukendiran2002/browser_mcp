@@ -1,0 +1,334 @@
+{
+  "stack_list": [
+    {
+      "content": [
+        [
+          "[document]",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "html",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "body",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "main",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "table",
+          {
+            "class": [
+              "specs"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "tbody",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "tr",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "td",
+          {
+            "class": "",
+            "style": ""
+          }
+        ]
+      ],
+      "wanted_attr": null,
+      "is_full_url": null,
+      "is_non_rec_text": null,
+      "url": "",
+      "hash": "fff6ffa745db1568f4a19eef780176b1f23c08856c605dfdf1e11d4c18839552",
+      "stack_id": "rule_fff6ffa7",
+      "alias": "name"
+    },
+    {
+      "content": [
+        [
+          "[document]",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "html",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "body",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "main",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "products"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "product",
+              "card"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "h2",
+          {
+            "class": [
+              "name"
+            ],
+            "style": ""
+          }
+        ]
+      ],
+      "wanted_attr": null,
+      "is_full_url": null,
+      "is_non_rec_text": null,
+      "url": "",
+      "hash": "d5d502e6550bb7cfa0ec267fb8519a30bc56de796fdbed2fe9e9c3a90baf10b5",
+      "stack_id": "rule_d5d502e6",
+      "alias": "name"
+    },
+    {
+      "content": [
+        [
+          "[document]",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "html",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "body",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "main",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "products"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "product",
+              "card"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "a",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "img",
+          {
+            "class": "",
+            "style": ""
+          }
+        ]
+      ],
+      "wanted_attr": "alt",
+      "is_full_url": null,
+      "is_non_rec_text": null,
+      "url": "",
+      "hash": "f71251555eb154da7f6d42d7e6f314df935e61b99875d52e51b7690530a567ad",
+      "stack_id": "rule_f7125155",
+      "alias": "name"
+    },
+    {
+      "content": [
+        [
+          "[document]",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "html",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "body",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "main",
+          {
+            "class": "",
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "products"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "div",
+          {
+            "class": [
+              "product",
+              "card"
+            ],
+            "style": ""
+          },
+          0
+        ],
+        [
+          "span",
+          {
+            "class": [
+              "price"
+            ],
+            "style": ""
+          }
+        ]
+      ],
+      "wanted_attr": null,
+      "is_full_url": null,
+      "is_non_rec_text": null,
+      "url": "",
+      "hash": "d4930403fa04fe311a57c6ef0ff2f87371370f5746512b9b2c634cf9bfdb2744",
+      "stack_id": "rule_d4930403",
+      "alias": "price"
+    }
+  ],
+  "content_fingerprints": {
+    "6bdd6e59": {
+      "sample_texts": [
+        "iPhone 15",
+        "Galaxy S24",
+        "Samsung Galaxy S24",
+        "Google Pixel 8",
+        "OnePlus 12",
+        "Pixel 8",
+        "$999.00",
+        "$899.00",
+        "$699.00",
+        "$799.00"
+      ],
+      "count": 10,
+      "avg_length": 9.6,
+      "min_length": 7,
+      "max_length": 18,
+      "std_length": 3.5270384177096785,
+      "avg_word_count": 1.8,
+      "min_word_count": 1,
+      "max_word_count": 3,
+      "content_type": "short_text",
+      "has_currency": true,
+      "avg_digit_ratio": 0.3804761904761905,
+      "avg_alpha_ratio": 0.4344444444444444,
+      "alias": ""
+    }
+  }
+}

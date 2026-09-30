@@ -13,6 +13,8 @@ import {
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { spawn, ChildProcess } from "node:child_process";
 import { getDevicePreset, DevicePreset, DEVICE_PRESETS } from "./devices.js";
+import { policyActive, denyReason } from "./policy.js";
+import { captureApis, type ApiCall } from "./apis.js";
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -65,6 +67,8 @@ export interface BrowserConnectionOptions {
   blockServiceWorkers?: boolean;
   /** Browser channel: 'chrome', 'msedge', 'chrome-beta', 'msedge-dev' — uses YOUR installed browser */
   channel?: string;
+  /** Human-like timing and mouse motion (slower, stealthier). Default: false (fast). */
+  human?: boolean;
 }
 
 export interface ConsoleLogEntry {
@@ -86,8 +90,9 @@ export interface NetworkLogEntry {
 
 // ─── Anti-Detection ──────────────────────────────────────────
 
-/** Minimal stealth script — only hides the webdriver flag, nothing else.
- *  All other browser properties stay real to avoid detection. */
+/** Minimal stealth script for Firefox/WebKit — only hides the webdriver flag.
+ *  Chromium doesn't need it: --disable-blink-features=AutomationControlled already
+ *  reports navigator.webdriver=false, and redefining it would itself be detectable. */
 const STEALTH_SCRIPT = `
   // Hide the webdriver flag that Playwright sets
   Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -99,6 +104,18 @@ const STEALTH_SCRIPT = `
 const STEALTH_ARGS = [
   "--disable-blink-features=AutomationControlled",
 ];
+
+/** Regular (non-headless) Chrome user agent for the given browser version. */
+export function chromeUserAgent(version: string): string {
+  const major = (version.match(/^(\d+)/) || [])[1] || "140";
+  const platform =
+    process.platform === "win32"
+      ? "Windows NT 10.0; Win64; x64"
+      : process.platform === "darwin"
+        ? "Macintosh; Intel Mac OS X 10_15_7"
+        : "X11; Linux x86_64";
+  return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
 
 // ─── Browser Manager ─────────────────────────────────────────
 
@@ -112,11 +129,22 @@ export class BrowserManager {
   private context: BrowserContext | null = null;
   private pages: Map<number, Page> = new Map();
   private nextPageId = 1;
+  private activePageId: number | null = null;
+  private connecting: Promise<string> | null = null;
+  /** Pages opened by the scraper pool — hidden from the agent's tab list. */
+  private internalPages = new WeakSet<Page>();
+  private pendingInternal = 0;
+  /** Attached to someone else's browser over CDP: never close their contexts. */
+  private viaCdp = false;
+  /** Pending handle_dialog instruction and last dialog seen, per page. */
+  private nextDialog = new WeakMap<Page, { action: "accept" | "dismiss"; promptText?: string }>();
+  private dialogNotes = new WeakMap<Page, string>();
   options: BrowserConnectionOptions;
 
   // Tracking infrastructure
   private consoleLogs: Map<number, ConsoleLogEntry[]> = new Map();
   private networkLogs: Map<number, NetworkLogEntry[]> = new Map();
+  private apiCalls: Map<number, ApiCall[]> = new Map();
   private blockedPatterns: string[] = [];
   private isRecordingVideo = false;
   private chromeProcess: ChildProcess | null = null;
@@ -142,6 +170,10 @@ export class BrowserManager {
       default:
         return chromium;
     }
+  }
+
+  private isChromium(): boolean {
+    return (this.options.browser ?? "chromium") === "chromium";
   }
 
   // ─── Context Options Builder ───────────────────────────────
@@ -236,6 +268,7 @@ export class BrowserManager {
   async connectCDP(cdpUrl?: string): Promise<void> {
     const url = cdpUrl ?? this.options.cdpUrl ?? "http://localhost:9222";
     this.browser = await chromium.connectOverCDP(url);
+    this.viaCdp = true;
     const contexts = this.browser.contexts();
 
     if (contexts.length > 0) {
@@ -247,18 +280,7 @@ export class BrowserManager {
       this.context = await this.browser.newContext();
     }
 
-    for (const page of this.context.pages()) {
-      const id = this.nextPageId++;
-      this.pages.set(id, page);
-      this.setupPageTracking(page, id);
-    }
-
-    // Listen for new tabs opened in the existing session
-    this.context.on("page", (page) => {
-      const id = this.nextPageId++;
-      this.pages.set(id, page);
-      this.setupPageTracking(page, id);
-    });
+    this.attachContext(this.context);
   }
 
   /**
@@ -285,12 +307,22 @@ export class BrowserManager {
         'C:\\Program Files (x86)\\Microsoft\\Edge Dev\\Application\\msedge.exe',
       ],
     };
+    if (process.platform === 'darwin') {
+      paths['chrome'] = ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'];
+      paths['chrome-beta'] = ['/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta'];
+      paths['msedge'] = ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'];
+    } else if (process.platform === 'linux') {
+      paths['chrome'] = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+      paths['chrome-beta'] = ['/usr/bin/google-chrome-beta'];
+      paths['msedge'] = ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable'];
+    }
     const candidates = paths[channel] || paths['chrome'];
     for (const p of candidates) {
       if (existsSync(p)) return p;
     }
     // If not found in known paths, just return the channel name and hope it's on PATH
-    return channel === 'msedge' ? 'msedge.exe' : 'chrome.exe';
+    if (process.platform === 'win32') return channel === 'msedge' ? 'msedge.exe' : 'chrome.exe';
+    return channel === 'msedge' ? 'microsoft-edge' : 'google-chrome';
   }
 
   /**
@@ -357,8 +389,8 @@ export class BrowserManager {
         headless: this.options.headless,
         executablePath: this.options.executablePath,
         channel: this.options.channel,
-        args: STEALTH_ARGS,
-        ignoreDefaultArgs: ["--enable-automation"],
+        args: this.isChromium() ? STEALTH_ARGS : [],
+        ignoreDefaultArgs: this.isChromium() ? ["--enable-automation"] : undefined,
         ...contextOpts,
       });
     } catch (err: any) {
@@ -380,19 +412,11 @@ export class BrowserManager {
       throw err;
     }
 
-    await this.context.addInitScript(STEALTH_SCRIPT);
-
-    for (const page of this.context.pages()) {
-      const id = this.nextPageId++;
-      this.pages.set(id, page);
-      this.setupPageTracking(page, id);
+    if (!this.isChromium()) {
+      await this.context.addInitScript(STEALTH_SCRIPT);
     }
 
-    this.context.on("page", (page) => {
-      const id = this.nextPageId++;
-      this.pages.set(id, page);
-      this.setupPageTracking(page, id);
-    });
+    this.attachContext(this.context);
   }
 
   /** Launch a fresh temporary browser (no session reuse). */
@@ -404,7 +428,7 @@ export class BrowserManager {
       headless: this.options.headless,
       executablePath: this.options.executablePath,
       channel: this.options.channel,
-      args: STEALTH_ARGS,
+      args: this.isChromium() ? STEALTH_ARGS : [],
     };
 
     if (this.options.proxyServer) {
@@ -416,23 +440,120 @@ export class BrowserManager {
 
     this.browser = await browserType.launch(launchOpts);
     delete contextOpts.proxy;
-    // Let the browser use its own real user agent — no fake UA override
+    // Headless Chromium announces itself as "HeadlessChrome" in the UA — the most
+    // common bot signal. Replace it with the regular Chrome UA for the same version.
+    if (this.options.headless && !contextOpts.userAgent && this.isChromium()) {
+      contextOpts.userAgent = chromeUserAgent(this.browser.version());
+    }
     this.context = await this.browser.newContext(contextOpts);
-    await this.context.addInitScript(STEALTH_SCRIPT);
+    if (!this.isChromium()) {
+      await this.context.addInitScript(STEALTH_SCRIPT);
+    }
 
     if (this.blockedPatterns.length > 0) {
       await this.applyRouteBlocking();
     }
 
-    this.context.on("page", (page) => {
-      const id = this.nextPageId++;
-      this.pages.set(id, page);
-      this.setupPageTracking(page, id);
+    this.attachContext(this.context);
+  }
+
+  /** Register existing and future pages of a context. */
+  private attachContext(ctx: BrowserContext): void {
+    if (policyActive()) {
+      // Enforce the domain policy on every top-level navigation (links, redirects, window.open).
+      ctx
+        .route("**/*", (route) => {
+          const req = route.request();
+          if (req.isNavigationRequest() && denyReason(req.url())) return route.abort("blockedbyclient");
+          return route.fallback();
+        })
+        .catch(() => {});
+    }
+    for (const page of ctx.pages()) this.activePageId = this.registerPage(page);
+    ctx.on("page", (page) => {
+      if (this.internalPages.has(page)) return;
+      if (this.pendingInternal > 0) {
+        this.pendingInternal--;
+        this.internalPages.add(page);
+        return;
+      }
+      // A tab opened by the site (target=_blank, window.open) becomes the active tab.
+      this.activePageId = this.registerPage(page);
     });
+    ctx.on("close", () => {
+      if (this.context === ctx) {
+        this.context = null;
+        this.pages.clear();
+        this.activePageId = null;
+      }
+    });
+  }
+
+  private registerPage(page: Page): number {
+    for (const [id, p] of this.pages) if (p === page) return id;
+    const id = this.nextPageId++;
+    this.pages.set(id, page);
+    this.setupPageTracking(page, id);
+    // Handle dialogs so they never block the page; report them in the next action result.
+    page.on("dialog", async (dialog) => {
+      const planned = this.nextDialog.get(page);
+      this.nextDialog.delete(page);
+      const action = planned?.action ?? (dialog.type() === "confirm" || dialog.type() === "prompt" ? "dismiss" : "accept");
+      try {
+        if (action === "accept") await dialog.accept(planned?.promptText);
+        else await dialog.dismiss();
+      } catch {
+        /* already handled */
+      }
+      this.dialogNotes.set(page, `${dialog.type()} "${dialog.message().slice(0, 200)}" → ${action}ed`);
+    });
+    page.on("close", () => {
+      this.pages.delete(id);
+      if (this.activePageId === id) {
+        const ids = [...this.pages.keys()];
+        this.activePageId = ids.length ? ids[ids.length - 1] : null;
+      }
+    });
+    return id;
+  }
+
+  private lastUsed = Date.now();
+  private idleTimer: NodeJS.Timeout | null = null;
+
+  /** Close a browser we launched after `ms` without tool activity (0 disables). CDP-attached browsers are left alone. */
+  setIdleTimeout(ms: number): void {
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = null;
+    if (ms <= 0) return;
+    this.idleTimer = setInterval(() => {
+      if (this.context && !this.viaCdp && Date.now() - this.lastUsed > ms) {
+        console.error("[browser-mcp] idle timeout — closing browser (reopens on next use)");
+        this.close().catch(() => {});
+      }
+    }, Math.min(ms, 30_000));
+    this.idleTimer.unref();
+  }
+
+  /** Connect on first use so agents don't need an explicit browser_connect call. */
+  async ensureContext(): Promise<BrowserContext> {
+    this.lastUsed = Date.now();
+    if (this.context) return this.context;
+    if (!this.connecting) {
+      this.connecting = this.connect().finally(() => {
+        this.connecting = null;
+      });
+    }
+    await this.connecting;
+    return this.getContext();
+  }
+
+  isConnected(): boolean {
+    return !!this.context;
   }
 
   /** Smart connect: tries CDP first, then persistent dir, then temp launch. */
   async connect(): Promise<string> {
+    if (this.context || this.browser) await this.close();
     if (this.options.cdpUrl) {
       await this.connectCDP();
       return `Connected via CDP to ${this.options.cdpUrl}`;
@@ -465,11 +586,12 @@ export class BrowserManager {
   // ─── Page Tracking ─────────────────────────────────────────
 
   private setupPageTracking(page: Page, pageId: number): void {
-    // Console log capture
+    // Console log capture (ring buffer: keeps the most recent entries)
     this.consoleLogs.set(pageId, []);
     page.on("console", (msg: ConsoleMessage) => {
       const logs = this.consoleLogs.get(pageId);
-      if (logs && logs.length < 500) {
+      if (logs) {
+        if (logs.length >= 500) logs.shift();
         logs.push({
           type: msg.type(),
           text: msg.text(),
@@ -481,32 +603,33 @@ export class BrowserManager {
 
     // Network request/response tracking
     this.networkLogs.set(pageId, []);
-    const pendingRequests = new Map<string, { url: string; method: string; resourceType: string; timestamp: number }>();
+    const started = new WeakMap<Request, number>();
 
     page.on("request", (request: Request) => {
-      pendingRequests.set(request.url(), {
-        url: request.url(),
-        method: request.method(),
-        resourceType: request.resourceType(),
-        timestamp: Date.now(),
-      });
+      started.set(request, Date.now());
     });
 
-    page.on("response", (response: Response) => {
+    const record = (request: Request, status?: number) => {
       const logs = this.networkLogs.get(pageId);
-      const reqInfo = pendingRequests.get(response.url());
-      if (logs && logs.length < 500) {
-        logs.push({
-          url: response.url(),
-          method: reqInfo?.method || "GET",
-          status: response.status(),
-          resourceType: reqInfo?.resourceType || "other",
-          timestamp: Date.now(),
-          duration: reqInfo ? Date.now() - reqInfo.timestamp : undefined,
-        });
-      }
-      pendingRequests.delete(response.url());
-    });
+      if (!logs) return;
+      if (logs.length >= 500) logs.shift();
+      const t0 = started.get(request);
+      logs.push({
+        url: request.url(),
+        method: request.method(),
+        status,
+        resourceType: request.resourceType(),
+        timestamp: Date.now(),
+        duration: t0 ? Date.now() - t0 : undefined,
+      });
+    };
+    page.on("response", (response: Response) => record(response.request(), response.status()));
+    page.on("requestfailed", (request: Request) => record(request, 0));
+
+    // JSON XHR/fetch responses for list_apis / call_api.
+    const apis: ApiCall[] = [];
+    this.apiCalls.set(pageId, apis);
+    captureApis(page, apis);
 
     page.on("close", () => {
       this.consoleLogs.delete(pageId);
@@ -521,29 +644,76 @@ export class BrowserManager {
     return this.context;
   }
 
+  /** Open a page for background work (scraping). It never becomes the agent's active tab. */
+  async newInternalPage(): Promise<Page> {
+    const ctx = await this.ensureContext();
+    this.pendingInternal++;
+    let page: Page;
+    try {
+      page = await ctx.newPage();
+    } catch (e) {
+      this.pendingInternal = Math.max(0, this.pendingInternal - 1);
+      throw e;
+    }
+    if (!this.internalPages.has(page)) {
+      // Our "page" event hasn't fired yet: release our claim and mark the page now.
+      this.pendingInternal = Math.max(0, this.pendingInternal - 1);
+      this.internalPages.add(page);
+    }
+    // Under concurrency the event may have been attributed to a user tab; undo that.
+    for (const [id, p] of this.pages) {
+      if (p === page) {
+        this.pages.delete(id);
+        if (this.activePageId === id) {
+          const ids = [...this.pages.keys()];
+          this.activePageId = ids.length ? ids[ids.length - 1] : null;
+        }
+      }
+    }
+    return page;
+  }
+
   getBrowserInstance(): Browser | null {
     return this.browser;
   }
 
   async getOrCreatePage(pageId?: number): Promise<{ id: number; page: Page }> {
+    await this.ensureContext();
     if (pageId !== undefined) {
       const page = this.pages.get(pageId);
       if (!page) throw new Error(`Page ${pageId} not found. Use list_pages to see available pages.`);
       return { id: pageId, page };
     }
+    if (this.activePageId !== null && this.pages.has(this.activePageId)) {
+      return { id: this.activePageId, page: this.pages.get(this.activePageId)! };
+    }
     if (this.pages.size > 0) {
       const lastId = Math.max(...this.pages.keys());
+      this.activePageId = lastId;
       return { id: lastId, page: this.pages.get(lastId)! };
     }
     return this.newPage();
   }
 
+  setNextDialog(page: Page, action: "accept" | "dismiss", promptText?: string): void {
+    this.nextDialog.set(page, { action, promptText });
+  }
+
+  takeDialogNote(page: Page): string | undefined {
+    const n = this.dialogNotes.get(page);
+    this.dialogNotes.delete(page);
+    return n;
+  }
+
+  getActivePageId(): number | null {
+    return this.activePageId;
+  }
+
   async newPage(url?: string): Promise<{ id: number; page: Page }> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     const page = await ctx.newPage();
-    const id = this.nextPageId++;
-    this.pages.set(id, page);
-    this.setupPageTracking(page, id);
+    const id = this.registerPage(page);
+    this.activePageId = id;
     if (url) await page.goto(url, { waitUntil: "domcontentloaded" });
     return { id, page };
   }
@@ -560,9 +730,9 @@ export class BrowserManager {
 
   async focusPage(pageId: number): Promise<void> {
     const page = this.pages.get(pageId);
-    if (page) {
-      await page.bringToFront();
-    }
+    if (!page) throw new Error(`Page ${pageId} not found`);
+    await page.bringToFront();
+    this.activePageId = pageId;
   }
 
   listPages(): { id: number; url: string; title: string }[] {
@@ -600,6 +770,15 @@ export class BrowserManager {
     this.consoleLogs.set(pageId, []);
   }
 
+  getApiCalls(pageId: number): ApiCall[] {
+    return this.apiCalls.get(pageId) || [];
+  }
+
+  /** All captured API calls across tabs, newest last. */
+  getAllApiCalls(): ApiCall[] {
+    return [...this.apiCalls.values()].flat().sort((a, b) => a.at - b.at);
+  }
+
   getNetworkLogs(pageId: number): NetworkLogEntry[] {
     return this.networkLogs.get(pageId) || [];
   }
@@ -623,7 +802,7 @@ export class BrowserManager {
   }
 
   async applyRouteBlocking(): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     for (const pattern of this.blockedPatterns) {
       await ctx.route(pattern, (route) => route.abort());
     }
@@ -632,7 +811,7 @@ export class BrowserManager {
   // ─── Storage State ─────────────────────────────────────────
 
   async saveStorageState(filePath: string): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     const state = await ctx.storageState();
     writeFileSync(filePath, JSON.stringify(state, null, 2));
   }
@@ -640,7 +819,7 @@ export class BrowserManager {
   async loadStorageState(filePath: string): Promise<void> {
     if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
     const state = JSON.parse(readFileSync(filePath, "utf-8"));
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     await ctx.addCookies(state.cookies || []);
     for (const origin of state.origins || []) {
       const pages = ctx.pages();
@@ -662,24 +841,24 @@ export class BrowserManager {
   // ─── Geolocation & Permissions ─────────────────────────────
 
   async setGeolocation(latitude: number, longitude: number, accuracy?: number): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     await ctx.setGeolocation({ latitude, longitude, accuracy: accuracy || 100 });
   }
 
   async grantPermissions(permissions: string[], origin?: string): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     await ctx.grantPermissions(permissions, origin ? { origin } : undefined);
   }
 
   async clearPermissions(): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     await ctx.clearPermissions();
   }
 
   // ─── Extra Headers ─────────────────────────────────────────
 
   async setExtraHTTPHeaders(headers: Record<string, string>): Promise<void> {
-    const ctx = this.getContext();
+    const ctx = await this.ensureContext();
     await ctx.setExtraHTTPHeaders(headers);
   }
 
@@ -695,6 +874,8 @@ export class BrowserManager {
         ? `${this.options.viewportWidth}x${this.options.viewportHeight}`
         : "auto",
       pages: this.pages.size,
+      activePage: this.activePageId,
+      human: !!this.options.human,
       recordingVideo: this.isRecordingVideo,
       blockedPatterns: this.blockedPatterns.length,
       connected: !!this.context,
@@ -704,7 +885,7 @@ export class BrowserManager {
   // ─── Cleanup ───────────────────────────────────────────────
 
   async close(): Promise<void> {
-    if (this.context) {
+    if (this.context && !this.viaCdp) {
       try {
         await this.context.close();
       } catch {
@@ -730,7 +911,9 @@ export class BrowserManager {
     this.pages.clear();
     this.consoleLogs.clear();
     this.networkLogs.clear();
+    this.activePageId = null;
     this.context = null;
     this.browser = null;
+    this.viaCdp = false;
   }
 }

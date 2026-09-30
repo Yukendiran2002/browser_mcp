@@ -1,5 +1,5 @@
 # ── Stage 1: Build ──────────────────────────────────────────
-FROM node:20-slim AS builder
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # ── Stage 2: Runtime ────────────────────────────────────────
-FROM node:20-slim
+FROM node:22-slim
 
 # Install Playwright system dependencies for Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,5 +31,9 @@ RUN npx playwright install chromium
 
 COPY --from=builder /app/dist ./dist
 
-# Default: listen on stdio for MCP protocol
+# No display in the container: always run headless.
+ENV BROWSER_HEADLESS=1
+
+# Default: MCP over stdio. For remote use pass e.g. `--http 8931 --host 0.0.0.0 --token <secret>`.
+EXPOSE 8931
 ENTRYPOINT ["node", "dist/index.js"]
